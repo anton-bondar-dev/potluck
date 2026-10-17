@@ -87,9 +87,18 @@ async def collecting_pool(pp, b, *, horizon=3600):
     return pid, {i["cid"]: i for i in await store.get_invoices(pid)}
 
 
-def new_ticker(pp, b, llm=None):
-    return ticker.Ticker(pp=pp, llm=llm or CountingLLM(),
-                         meter=agent_core.TokenMeter(budget=500_000), bus=b, interval_s=0.05)
+def new_ticker(pp, b, llm=None, sweep_every_s=0.0):
+    """A ticker whose invoice sweep runs on every pass by default.
+
+    Production sweeps on a slower cadence than it ticks, because a settled invoice cannot
+    change and PayPal is rate-limited. Most tests here are about WHICH transitions are
+    worth a model turn, not about the cadence, so they drive the sweep directly;
+    `sweep_cadence()` below tests the cadence itself.
+    """
+    t = ticker.Ticker(pp=pp, llm=llm or CountingLLM(),
+                      meter=agent_core.TokenMeter(budget=500_000), bus=b, interval_s=0.05)
+    t.sweep_every_s = sweep_every_s
+    return t
 
 
 async def events(pid, etype=None):
@@ -134,6 +143,36 @@ async def zero_token_payments(pp, b):
     check("the sweep is labelled as the ticker's own work on the wire",
           any(e["origin"] == "ticker" for e in await events(pid, "paypal_call")),
           [e.get("origin") for e in await events(pid, "paypal_call")][:4])
+
+
+async def sweep_cadence(pp, b):
+    print("\n-- the sweep has its own, slower cadence --")
+    await fresh()
+    pid, invs = await collecting_pool(pp, b)
+    t = new_ticker(pp, b, sweep_every_s=5.0)
+    await t.tick_once()
+    first = len([e for e in await events(pid, "paypal_call") if e["origin"] == "ticker"])
+    check("the first pass sweeps", first >= 1, first)
+    await t.tick_once()
+    await t.tick_once()
+    again = len([e for e in await events(pid, "paypal_call") if e["origin"] == "ticker"])
+    check("the next passes do not re-poll within the window", again == first, (first, again))
+    check("but the clock keeps ticking every pass",
+          len(await events(pid, "clock_tick")) >= 3, len(await events(pid, "clock_tick")))
+    t.last_sweep[pid] = 0.0
+    await t.tick_once()
+    check("and it sweeps again once the window elapses",
+          len([e for e in await events(pid, "paypal_call") if e["origin"] == "ticker"]) > again)
+
+    await fresh()
+    pid, invs = await collecting_pool(pp, b)
+    t = new_ticker(pp, b)
+    await pp.record_payment(invs["c0"]["invoice_id"], 4500)
+    await t.tick_once()
+    before = len([e for e in await events(pid, "paypal_call") if e["origin"] == "ticker"])
+    await t.tick_once()
+    after = len([e for e in await events(pid, "paypal_call") if e["origin"] == "ticker"])
+    check("A SETTLED INVOICE IS NEVER POLLED AGAIN", after - before == 4, after - before)
 
 
 async def interesting_transitions(pp, b):
@@ -360,6 +399,7 @@ async def main():
     b = EventBus()
     async with get_paypal_client(on_call=bus_mod.stream_paypal_call) as pp:
         await zero_token_payments(pp, b)
+        await sweep_cadence(pp, b)
         await interesting_transitions(pp, b)
         await draft_and_sleep(pp, b)
         await deadline_and_escalation(pp, b)

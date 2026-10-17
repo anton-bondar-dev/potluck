@@ -50,6 +50,10 @@ from tools import ToolContext
 MUTATING = {"plan_pool", "send_invoices", "remind_contributors", "drop_contributor",
             "resolve_pool", "close_pool"}
 
+# Wakes that may spend the token reserve. Everything else has to leave it alone, so the
+# window is never empty at the moment the pool actually needs a decision.
+PRIORITY_TRIGGERS = {"deadline", "human", "pool_created"}
+
 # Reads whose older results are strictly worse copies of their newest one.
 SUPERSEDABLE = ("check_payments", "check_payout")
 SUPERSEDED = '{"superseded": true}'
@@ -141,17 +145,23 @@ class TokenMeter:
     def headroom_pct(self) -> int:
         return int(100 * self.remaining() / max(1, self.budget))
 
-    def admits(self, estimate: int) -> bool:
-        return estimate <= self.remaining()
+    def admits(self, estimate: int, reserve: int = 0) -> bool:
+        """Can an episode of roughly this size start?
 
-    def retry_in_s(self, estimate: int) -> int:
+        `reserve` is what a ROUTINE wake must leave behind. The deadline episode is the
+        one that must never be the one that gets deferred, so it passes reserve=0 and may
+        spend the window down to nothing.
+        """
+        return estimate <= self.remaining() - max(0, reserve)
+
+    def retry_in_s(self, estimate: int, reserve: int = 0) -> int:
         """When enough of the window will have expired to fit `estimate`.
 
         Returned to the UI as a real countdown rather than a spinner: throttling shown as
         a number is transparency, the same thing hidden is a hang.
         """
         self._evict()
-        need = estimate - self.remaining()
+        need = estimate + max(0, reserve) - self.remaining()
         if need <= 0:
             return 0
         now, freed = time.time(), 0
@@ -432,7 +442,8 @@ def _call_key(name: str, args: dict) -> str:
 # --- the episode --------------------------------------------------------------
 async def run_episode(*, pool_id: str, trigger: str, pp, llm, meter: TokenMeter,
                       bus=event_bus, changes: list[dict] | None = None,
-                      human_message: str | None = None) -> EpisodeResult:
+                      human_message: str | None = None,
+                      priority: bool | None = None) -> EpisodeResult:
     """Wake the model, let it act for a few turns, stop.
 
     The caller — the ticker — owns two things this function trusts it for: the pool's row
@@ -475,11 +486,15 @@ async def run_episode(*, pool_id: str, trigger: str, pp, llm, meter: TokenMeter,
     menu = tools.menu_for_phase(phase, deadline_reached=snap["deadline_reached"],
                                target_met=snap["collected_cents"] >= snap["target_cents"])
     estimate = estimate_tokens(messages, menu)
-    if not meter.admits(estimate):
-        retry = meter.retry_in_s(estimate)
+    if priority is None:
+        priority = trigger in PRIORITY_TRIGGERS
+    reserve = 0 if priority else settings.groq_tpm_reserve
+    if not meter.admits(estimate, reserve):
+        retry = meter.retry_in_s(estimate, reserve)
         await bus.publish(pool_id, "episode_deferred", {
             "reason": "budget", "retry_in_s": retry,
-            "detail": f"{meter.remaining()} tokens left in the 60s window, need ~{estimate}"})
+            "detail": f"{meter.remaining()} tokens left in the 60s window, need ~{estimate}"
+                      + (f" and {reserve} is reserved for the deadline" if reserve else "")})
         return EpisodeResult(ran=False, reason="tpm", retry_in_s=retry)
 
     episode_id = await store.start_episode(pool_id, trigger)

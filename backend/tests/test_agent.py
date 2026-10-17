@@ -437,6 +437,28 @@ async def refusals(pp, b):
           dfr and dfr[0]["reason"] == "budget" and dfr[0]["retry_in_s"] > 0, dfr)
     check("no episode row was opened", await store.last_episode(pid) is None)
 
+    # the token reserve: a routine wake must leave the deadline something to spend
+    pid = await new_pool()
+    meter = TokenMeter(budget=10_000)
+    meter.record(10_000 - settings.groq_tpm_reserve - 200)   # just inside the reserve
+    r = await run_episode(pool_id=pid, trigger="tick", pp=pp, llm=ScriptedLLM([]),
+                          meter=meter, bus=b)
+    check("a ROUTINE wake will not spend the deadline's reserve",
+          not r.ran and r.reason == "tpm", r)
+    llm = ScriptedLLM([[("plan_pool", PLAN)], [("sleep_until", {"sleep_s": 9, "reason": "sent"})]])
+    r = await run_episode(pool_id=pid, trigger="deadline", pp=pp, llm=llm, meter=meter, bus=b)
+    check("THE DEADLINE MAY SPEND IT — it is the episode that must never be deferred",
+          r.ran, r)
+    check("and the same holds for a human and a new pool",
+          "deadline" in agent_core.PRIORITY_TRIGGERS
+          and "human" in agent_core.PRIORITY_TRIGGERS
+          and "pool_created" in agent_core.PRIORITY_TRIGGERS)
+    check("the caller can override the trigger's default priority",
+          (await run_episode(pool_id=await new_pool(), trigger="tick", pp=pp,
+                             llm=ScriptedLLM([[("plan_pool", PLAN)],
+                                              [("sleep_until", {"sleep_s": 9, "reason": "s"})]]),
+                             meter=meter, bus=b, priority=True)).ran)
+
     # the model is unreachable
     pid = await new_pool()
     llm = ScriptedLLM([LLMError("all groq models/keys failed: 429")])

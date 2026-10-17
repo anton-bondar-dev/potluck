@@ -257,6 +257,29 @@ def assert_settlement_valid(*, items: list[dict], frozen_collected_cents: int,
                          f"({settings.daily_payout_cents}c)")
 
 
+# PayPal's own terminal batch states. UNCLAIMED/FAILED items can sit INSIDE a SUCCESS
+# batch; that is reported per item on the receipt rather than hidden.
+TERMINAL_BATCH_STATUSES = {"SUCCESS", "DENIED", "CANCELED", "CANCELLED"}
+
+
+def check_closable(settlement: dict | None) -> None:
+    """A pool may not be closed while the payout is still in flight.
+
+    The live rehearsal closed a pool with its batch at PENDING, because the model was
+    offered close_pool and took it. On screen that reads as "done" before PayPal has said
+    so, which is the one claim this project cannot afford to get wrong. So the order is
+    enforced rather than suggested: poll until terminal, then close.
+    """
+    if not settlement:
+        raise GuardError("NOT_SETTLED", "nothing has been settled, so there is nothing to close")
+    status = settlement.get("batch_status") or "PENDING"
+    if status not in TERMINAL_BATCH_STATUSES:
+        raise GuardError("PAYOUT_NOT_TERMINAL",
+                         f"the payout batch is still {status}. Call check_payout until PayPal "
+                         f"reports a terminal status, then close — do not tell anyone the "
+                         f"money has arrived before it has.", batch_status=status)
+
+
 def check_late_refund(*, amount_cents: int, to_email: str, payer_email: str,
                       payouts_today_cents: int) -> None:
     """A payment that arrived after the pool was frozen goes straight back.

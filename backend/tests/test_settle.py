@@ -161,6 +161,38 @@ async def late_payments(pp, b):
           or not [e for e in await events(pid, "late_payment") if e["cid"] == "c5"])
 
 
+async def closing_too_early(pp, b):
+    print("\n-- a pool cannot say 'done' before PayPal has --")
+    pid, ctx, invs = await collecting(pp, b)
+    truth = await tools.refresh_from_paypal(ctx, include_terminal=True)
+    await tools.execute_settlement(
+        ctx, await store.get_pool(pid), decision="UNWIND", reason="short",
+        policy_quote="give everyone their money back", decided_by="agent",
+        attest={k: truth[k] for k in ("collected_cents", "paid_count", "ledger_version")})
+    s = await store.get_settlement(pid)
+    check("the batch starts in flight", s["batch_status"] == "PENDING", s["batch_status"])
+
+    out = await tools.dispatch(ctx, "close_pool", {"summary": "all done, money returned"})
+    check("CLOSING WHILE THE PAYOUT IS PENDING IS REFUSED",
+          out.get("error") == "PAYOUT_NOT_TERMINAL", out)
+    check("and the model is told to poll first", "check_payout" in out.get("detail", ""), out)
+    check("the pool is still settling", (await store.get_pool(pid))["phase"] == "SETTLING")
+    check("and nothing claimed completion on the stream", not await events(pid, "pool_closed"))
+
+    await asyncio.sleep(3.2)
+    await tools.dispatch(ctx, "check_payout", {"reason": "has it landed?"})
+    out = await tools.dispatch(ctx, "close_pool", {"summary": "refunds confirmed by PayPal"})
+    check("once PayPal reports terminal, closing works", out.get("phase") == "CLOSED", out)
+    check("and the pool is CLOSED", (await store.get_pool(pid))["phase"] == "CLOSED")
+
+    for bad, why in (({}, "no settlement"), (None, "nothing settled")):
+        try:
+            guards.check_closable(bad or None)
+            check(f"closing with {why} is refused", False, "not raised")
+        except guards.GuardError as exc:
+            check(f"closing with {why} is refused", exc.code in ("NOT_SETTLED",), exc.code)
+
+
 async def human_refund(pp, b):
     print("\n-- the human-approved refund on an escalated pool --")
     pid, ctx, invs = await collecting(pp, b)
@@ -269,6 +301,7 @@ async def main_test():
     async with get_paypal_client(on_call=bus_mod.stream_paypal_call) as pp:
         await one_path()
         await late_payments(pp, b)
+        await closing_too_early(pp, b)
         await human_refund(pp, b)
         await agent_keeps_the_last_word(pp, b)
         await migration()

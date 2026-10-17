@@ -272,6 +272,7 @@ async def main_test():
     async with get_paypal_client(on_call=bus_mod.stream_paypal_call) as pp:
         meter = agent_core.TokenMeter(budget=500_000)
         tick = Ticker(pp=pp, llm=llm, meter=meter, bus=bus_mod.bus, interval_s=0.05)
+        tick.sweep_every_s = 0.0           # drive the sweep directly; cadence is tested elsewhere
         main.state.update(pp=pp, llm=llm, meter=meter, ticker=tick, started_at=time.time())
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

@@ -186,7 +186,8 @@ class ToolContext:
 
 
 # --- ledger helpers ---------------------------------------------------------
-async def refresh_from_paypal(ctx: ToolContext, *, origin: str = "agent") -> dict:
+async def refresh_from_paypal(ctx: ToolContext, *, origin: str = "agent",
+                             include_terminal: bool = False) -> dict:
     """Re-derive the ledger from PayPal's own numbers. The single definition of 'paid'.
 
     Public because the ticker owns the routine sweep: it polls, writes the ledger and
@@ -198,7 +199,14 @@ async def refresh_from_paypal(ctx: ToolContext, *, origin: str = "agent") -> dic
     people = {c["cid"]: c for c in await store.get_contributors(ctx.pool_id)}
 
     async def one(inv):
-        if not inv.get("invoice_id") or inv["status"] in ("CANCELLED",):
+        # A paid or cancelled invoice cannot change again, so polling it every tick is
+        # pure load: one 69-second rehearsal made 125 real PayPal calls, most of them
+        # re-reading invoices that were already settled. The settle path passes
+        # include_terminal=True, because there the whole point is a fresh read of
+        # everything before money moves.
+        if not inv.get("invoice_id"):
+            return None
+        if not include_terminal and inv["status"] in store.TERMINAL_INVOICE_STATUSES:
             return None
         async with ctx._sem:
             try:
@@ -290,7 +298,8 @@ async def _plan_pool(ctx, args, pool):
                   "email_masked": mask_email(by_cid[cid]["email"]),
                   "share_cents": amt, "status": "pending"} for cid, amt in shares.items()],
         "target_cents": int(target), "recipient_name": by_cid[recipient_cid]["name"],
-        "policy_text": pool["policy_text"],
+        "policy_text": pool["policy_text"], "clock_scale": scale,
+        "deadline_at": deadline_at, "deadline_label": args.get("deadline_label", ""),
         "success_condition_restated": args["success_condition_restated"]})
     await ctx.emit("phase", {"from": "DRAFT", "to": "COLLECTING", "reason": "planned"})
 
@@ -464,7 +473,7 @@ async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_qu
         raise GuardError("BAD_ARGS", "decision must be RELEASE or UNWIND")
 
     # 1. Freeze the truth from PayPal itself, never from the ledger cache.
-    truth = await refresh_from_paypal(ctx, origin="settle")
+    truth = await refresh_from_paypal(ctx, origin="settle", include_terminal=True)
 
     # 2. Validate everything. Any failure below leaves the pool exactly as it was.
     if attest is not None:
@@ -616,6 +625,7 @@ async def poll_payout(ctx, args, pool, *, origin: str = "settle"):
 
 async def _close_pool(ctx, args, pool):
     s = await store.get_settlement(ctx.pool_id)
+    guards.check_closable(s)
     await store.advance(ctx.pool_id, "SETTLING", "CLOSED")
     await ctx.emit("pool_closed", {"phase": "CLOSED", "summary": (args.get("summary") or "")[:600],
                                    "decision": (s or {}).get("decision"),

@@ -30,7 +30,12 @@ class Settings(BaseSettings):
     groq_models: str = "openai/gpt-oss-120b,openai/gpt-oss-20b"
     # Admission control: free tier is ~8k tok/min per key. Sliding 60s window over
     # actual usage.total_tokens; an episode is deferred rather than throttled mid-run.
-    groq_tpm_budget: int = 22000
+    groq_tpm_budget: int = 28000
+    # Routine wakes (a tick, an ordinary payment) may only spend down to this much.
+    # The deadline, a human, a new pool and the target being crossed may spend it all.
+    # A live rehearsal exhausted the window exactly as the target was crossed and left a
+    # 24-second hole where the most important episode should have been.
+    groq_tpm_reserve: int = 9000
 
     # --- Agent episodes -----------------------------------------------------
     # The agent is disposable: it runs short episodes woken by the ticker, never a
@@ -53,6 +58,9 @@ class Settings(BaseSettings):
     # ONE real clock. clock_scale is display-only: it compresses the countdown the UI
     # renders and divides cooldowns. The agent always reasons in real seconds.
     tick_demo_s: int = 2
+    # The clock ticks every pass; invoices are swept every Nth, because a settled
+    # invoice cannot change and PayPal is rate-limited.
+    invoice_poll_every_ticks: int = 2
     tick_real_s: int = 60
     clock_scale_demo: int = 2880         # 90s of real time renders as ~3 days
     demo_horizon_s: int = 90

@@ -73,6 +73,15 @@ class Ticker:
         self.seen: dict[str, dict[str, tuple[str, int]]] = {}   # pool -> cid -> (status, paid)
         self.wake_at: dict[str, float] = {}
         self.nudged: dict[str, set[str]] = {}
+        self.nudge_round: dict[str, int] = {}      # total reminders sent, as a round marker
+        self.nudge_reported: dict[str, int] = {}   # the round we last woke the agent for
+        self.last_sweep: dict[str, float] = {}
+        # The clock ticks every pass because the countdown has to be smooth; invoices are
+        # swept on their own slower cadence, PER POOL, because a settled invoice cannot
+        # change and PayPal is rate-limited. Time-based rather than counting ticks: a
+        # global tick counter would make one pool's cadence depend on how many others
+        # happen to be live.
+        self.sweep_every_s = self.interval_s * max(1, settings.invoice_poll_every_ticks)
         self.human: dict[str, list[str]] = {}
         self.human_block: dict[str, float] = {}
         self.deadline_fired: set[str] = set()
@@ -209,7 +218,9 @@ class Ticker:
         # 2. The ledger sweep — the zero-token part. Poll what is not yet terminal, write
         #    what changed, stream the rows.
         changes: list[dict] = []
-        if phase in ("COLLECTING", "RESOLVING"):
+        due = time.time() - self.last_sweep.get(pid, 0.0) >= self.sweep_every_s
+        if phase in ("COLLECTING", "RESOLVING") and due:
+            self.last_sweep[pid] = time.time()
             changes, snap = await self._sweep(ctx, pid)
         else:
             snap = await tools.ledger_snapshot(ctx)
@@ -241,7 +252,9 @@ class Ticker:
         res = await agent_core.run_episode(
             pool_id=pid, trigger=trigger, pp=self.pp, llm=self.llm, meter=self.meter,
             bus=self.bus, changes=changes or None,
-            human_message="\n\n".join(human) if human else None)
+            human_message="\n\n".join(human) if human else None,
+            priority=(trigger in agent_core.PRIORITY_TRIGGERS
+                      or why == "the target was crossed"))
         self._schedule_next(pid, res)
         if human and not res.ran:
             # Undelivered. Put it back, but do not retry on every tick — a starved token
@@ -286,6 +299,7 @@ class Ticker:
         # Re-read who has been nudged. The agent may have reminded someone in the episode
         # that just ran, and their payment is exactly the transition worth waking it for.
         self.nudged[pid] = {r["cid"] for r in rows if int(r["reminders"] or 0) > 0}
+        self.nudge_round[pid] = sum(int(r["reminders"] or 0) for r in rows)
 
         changes = []
         for cid, (status, paid) in after.items():
@@ -415,8 +429,16 @@ class Ticker:
             c["paid_cents"] - c["was_paid_cents"] for c in arrived)
         if before_collected < target <= snap["collected_cents"]:
             return "the target was crossed"
+        # A nudge landing is interesting ONCE per round of reminders. In the live
+        # rehearsal the agent reminded every remaining contributor, which made every
+        # subsequent payment "a nudge landing" and woke it on all of them — the exact
+        # token flaw this rule exists to avoid. Reminding three people and hearing that
+        # the first of them paid is the signal; the other two are bookkeeping.
         nudged = self.nudged.get(pid) or set()
-        if any(c["cid"] in nudged for c in arrived):
+        round_id = self.nudge_round.get(pid, 0)
+        if (any(c["cid"] in nudged for c in arrived)
+                and round_id > self.nudge_reported.get(pid, 0)):
+            self.nudge_reported[pid] = round_id
             return "someone the agent nudged came through"
         for c in arrived:
             if c["share_cents"] and c["paid_cents"] != c["share_cents"]:
