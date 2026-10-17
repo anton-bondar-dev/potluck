@@ -32,6 +32,9 @@ ALLOWED_EDGES: set[tuple[str, str]] = {
     ("RESOLVING", "ESCALATED"),
     ("SETTLING", "CLOSED"),
     ("SETTLING", "ESCALATED"),
+    # A human approving the refund on an escalated pool executes it through the same
+    # settlement path the agent would have used, so it lands in SETTLING like any other.
+    ("ESCALATED", "SETTLING"),
     ("ESCALATED", "CLOSED"),
 }
 
@@ -78,6 +81,7 @@ CREATE TABLE IF NOT EXISTS invoices (
   paid_cents INTEGER NOT NULL DEFAULT 0,
   source     TEXT,
   reminders  INTEGER NOT NULL DEFAULT 0,
+  settled_cents INTEGER NOT NULL DEFAULT 0,
   last_reminder_at REAL,
   sent_at    REAL,
   paid_at    REAL,
@@ -126,6 +130,28 @@ _db: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
 
 
+# Columns added after the first deploy. CREATE TABLE IF NOT EXISTS does NOT add a column
+# to a database that already exists, so a schema change made this way is silently absent
+# on the server and fails later, inside the settle path, on camera. Each entry is applied
+# idempotently at boot.
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("invoices", "settled_cents", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+async def _migrate(conn: aiosqlite.Connection) -> list[str]:
+    applied = []
+    for table, column, decl in MIGRATIONS:
+        cur = await conn.execute(f"PRAGMA table_info({table})")
+        have = {r["name"] for r in await cur.fetchall()}
+        if column not in have:
+            await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            applied.append(f"{table}.{column}")
+    if applied:
+        await conn.commit()
+    return applied
+
+
 async def init_db(path: str | None = None) -> aiosqlite.Connection:
     """Open (once) and migrate. WAL + busy_timeout so the ticker and a request can
     interleave without 'database is locked'."""
@@ -139,6 +165,8 @@ async def init_db(path: str | None = None) -> aiosqlite.Connection:
     await _db.execute("PRAGMA foreign_keys=ON")
     await _db.executescript(SCHEMA)
     await _db.commit()
+    for added in await _migrate(_db):
+        print(f"[store] migrated: added {added}")
     return _db
 
 
@@ -353,6 +381,38 @@ async def set_invoice_state(pool_id: str, cid: str, *, status: str, paid_cents: 
         )
         await db().commit()
     return True
+
+
+async def freeze_paid_snapshot(pool_id: str) -> None:
+    """Stamp each invoice with what it had paid at settlement time.
+
+    This is the whole mechanism behind the late-payment sweep: afterwards,
+    `paid_cents > settled_cents` means money arrived after the pool was frozen, the
+    difference is exactly what has to go back, and refunding it twice is impossible
+    because the stamp moves with it.
+    """
+    async with _write_lock:
+        await db().execute(
+            "UPDATE invoices SET settled_cents = paid_cents WHERE pool_id=?", (pool_id,))
+        await db().commit()
+
+
+async def late_arrivals(pool_id: str) -> list[dict]:
+    """Invoices holding more than was frozen for them."""
+    cur = await db().execute(
+        "SELECT * FROM invoices WHERE pool_id=? AND paid_cents > settled_cents", (pool_id,))
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_late_refunded(pool_id: str, cid: str, up_to_cents: int) -> bool:
+    """Move the stamp. Guarded on the old value so two sweeps racing one late payment
+    cannot both refund it."""
+    async with _write_lock:
+        cur = await db().execute(
+            "UPDATE invoices SET settled_cents=? WHERE pool_id=? AND cid=? AND settled_cents<?",
+            (int(up_to_cents), pool_id, cid, int(up_to_cents)))
+        await db().commit()
+        return cur.rowcount == 1
 
 
 async def bump_reminder(pool_id: str, cid: str) -> None:

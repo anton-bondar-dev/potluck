@@ -31,6 +31,7 @@ import store
 import tools
 from bus import bus
 from config import settings
+from guards import GuardError
 from llm import make_llm
 from paypal import get_paypal_client
 from ticker import Ticker
@@ -129,6 +130,11 @@ class MessageIn(BaseModel):
 
 class PayIn(BaseModel):
     amount_cents: int | None = None        # omitted = pay the share in full
+
+
+class ApproveIn(BaseModel):
+    # A note is optional: the button sends {} and that must not be a validation error.
+    note: str = Field(default="", max_length=MAX_MESSAGE)
 
 
 # --- projection -------------------------------------------------------------
@@ -346,6 +352,41 @@ async def message_agent(pool_id: str, body: MessageIn, request: Request):
     await bus.publish(pool_id, "human_message", {"text": text})
     state["ticker"].message(pool_id, text)
     return {"ok": True, "queued": True}
+
+
+@app.post("/api/pools/{pool_id}/approve-refund")
+async def approve_refund(pool_id: str, request: Request, body: ApproveIn | None = None):
+    """The button on an escalated pool's card. The only way a human moves money here.
+
+    An escalated pool is one the agent never resolved — the deadline and its grace window
+    passed, or the model was unreachable through both. Code did not decide for it and
+    will not: every cent sits exactly where it was, and this endpoint executes the one
+    action a human can authorise, through the same settlement path the agent would have
+    used. The human supplies an approval, not an amount and not a destination.
+    """
+    if not _rate_ok("refund", _client_ip(request), 6):
+        raise HTTPException(429, "slow down a moment")
+    pool = await _pool_or_404(pool_id)
+    if pool["phase"] != "ESCALATED":
+        raise HTTPException(409, f"this pool is {pool['phase']} — only an escalated pool "
+                                 "is waiting on a human")
+    note = (body.note.strip() if body and body.note else "")
+    ctx = tools.ToolContext(pool_id, state["pp"], bus)
+    with bus_mod.pool_scope(pool_id):
+        try:
+            out = await tools.execute_settlement(
+                ctx, pool, decision="UNWIND",
+                reason="A human approved returning every contribution after this pool "
+                       "escalated undecided." + (f" Note: {note}" if note else ""),
+                policy_quote="", decided_by="human", attest=None)
+        except GuardError as exc:
+            raise HTTPException(409, exc.as_dict()) from exc
+        except Exception as exc:                          # noqa: BLE001
+            await bus.publish(pool_id, "error", {"where": "approve_refund",
+                                                 "message": str(exc)[:200],
+                                                 "recoverable": True})
+            raise HTTPException(502, f"the refund could not be submitted: {str(exc)[:160]}") from exc
+    return out
 
 
 @app.get("/api/healthz")

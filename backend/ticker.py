@@ -34,6 +34,7 @@ import time
 import agent_core
 import bus as bus_mod
 import clock
+import guards
 import store
 import tools
 from bus import bus as event_bus
@@ -213,9 +214,13 @@ class Ticker:
         else:
             snap = await tools.ledger_snapshot(ctx)
 
-        # 3. An in-flight batch resolves itself, with no model turn spent on watching it.
+        # 3. An in-flight batch resolves itself, with no model turn spent on watching it,
+        #    and anything that arrived after the freeze goes straight back.
         if phase == "SETTLING":
             await self._reconcile(pool)
+            await self._late_sweep(ctx, pool)
+            if await self._auto_close(ctx, pool):
+                return {"pool_id": pid, "action": "closed"}
 
         # 4. Freeze rather than guess: past the deadline AND past the grace, a pool that
         #    still has not been resolved goes to a human. Code does not decide for it.
@@ -300,6 +305,89 @@ class Ticker:
         if changes:
             await self.bus.publish(pid, "pool_totals", snap)
         return changes, snap
+
+    async def _late_sweep(self, ctx: tools.ToolContext, pool: dict) -> list[dict]:
+        """Money that arrived after the pool was frozen goes back. No model involved.
+
+        There is a window between freezing the collected total and cancelling the unpaid
+        invoices, and a payment can land inside it. Returning exactly what someone paid,
+        to the address they paid from, is arithmetic — NO AGENCY WHERE THERE IS NO
+        DECISION — so letting the model anywhere near it would be theatre with a cost.
+        """
+        pid = pool["pool_id"]
+        await tools.refresh_from_paypal(ctx, origin="ticker")
+        late = await store.late_arrivals(pid)
+        if not late:
+            return []
+        people = {c["cid"]: c for c in await store.get_contributors(pid)}
+        done = []
+        for inv in late:
+            cid, paid = inv["cid"], int(inv["paid_cents"])
+            amount = paid - int(inv["settled_cents"])
+            who = people.get(cid) or {}
+            try:
+                guards.check_late_refund(
+                    amount_cents=amount, to_email=who.get("email", ""),
+                    payer_email=who.get("email", "~"),
+                    payouts_today_cents=await store.payouts_today_cents())
+            except guards.GuardError as exc:
+                await self.bus.publish(pid, "guard_block", {
+                    "tool": "late_refund", "rule": exc.code, "detail": exc.detail,
+                    "retry_allowed": False})
+                continue
+            # Write-ahead BEFORE the money call. A crash between the two leaves a cent
+            # retained — recoverable by a human — rather than paid twice, which is not.
+            if not await store.mark_late_refunded(pid, cid, paid):
+                continue                                  # another sweep already took it
+            sbid = guards.sender_batch_id(pid, f"late-{cid}-{paid}")
+            try:
+                batch = await ctx.pp.create_payout(
+                    sbid, [{"email": who["email"], "amount_cents": amount,
+                            "note": "Potluck late payment returned", "sender_item_id": cid}],
+                    subject="Potluck", origin="ticker")
+            except Exception as exc:                      # noqa: BLE001
+                await self.bus.publish(pid, "late_payment", {
+                    "cid": cid, "name": who.get("name"), "paid_cents": amount,
+                    "action": "REFUND_FAILED", "detail": str(exc)[:160]})
+                await self.bus.publish(pid, "error", {
+                    "where": "late_refund", "recoverable": False,
+                    "message": f"{amount}c from {who.get('name')} is held and needs a human"})
+                continue
+            await self.bus.publish(pid, "late_payment", {
+                "cid": cid, "name": who.get("name"), "paid_cents": amount,
+                "action": "REFUNDED", "batch_id": batch.get("payout_batch_id", ""),
+                "sender_batch_id": sbid})
+            done.append({"cid": cid, "amount_cents": amount})
+        return done
+
+    async def _auto_close(self, ctx: tools.ToolContext, pool: dict) -> bool:
+        """Close a settled pool that nobody is left to close.
+
+        The agent normally writes the closing summary itself. But its episode budget can
+        be spent, and a human-approved refund has no agent in the loop at all — and a pool
+        stuck in SETTLING after the money has landed reads as a hang. Stating that a
+        batch which PayPal says succeeded has succeeded is not a judgement, so code may
+        say it; it still cannot decide anything, because everything is already decided.
+        """
+        s = await store.get_settlement(pool["pool_id"])
+        if not s or s.get("batch_status") != "SUCCESS":
+            return False
+        agent_can_act = (int(pool["episodes_used"]) < settings.max_episodes
+                         and s.get("decided_by") == "agent")
+        if agent_can_act:
+            return False                                  # leave the last word to the agent
+        if not await store.advance(pool["pool_id"], "SETTLING", "CLOSED"):
+            return False
+        total = sum(int(i["amount_cents"]) for i in (s.get("items") or []))
+        await self.bus.publish(pool["pool_id"], "phase", {
+            "from": "SETTLING", "to": "CLOSED", "reason": "batch settled"})
+        await self.bus.publish(pool["pool_id"], "pool_closed", {
+            "phase": "CLOSED", "by": "system",
+            "summary": f"{s['decision']} completed: {len(s.get('items') or [])} payout item(s), "
+                       f"{total} cents, batch {s.get('batch_id')} reported SUCCESS by PayPal.",
+            "decided_by": s.get("decided_by")})
+        self.wake_at.pop(pool["pool_id"], None)
+        return True
 
     def _out_of_time(self, pool: dict) -> bool:
         """Past the deadline and out of either patience or model budget."""

@@ -421,15 +421,20 @@ async def _sleep_until(ctx, args, pool):
             "requested_s": want, "clamped": sleep_s != want}
 
 
-async def _resolve_pool(ctx, args, pool):
-    """The only money-out chokepoint. Code supplies every amount and destination.
+async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_quote: str,
+                             decided_by: str, attest: dict | None = None) -> dict:
+    """THE ONE MONEY-OUT PATH. Both the agent's `resolve_pool` and a human's approved
+    refund come through here, so there is exactly one function to audit.
 
-    Ordering matters more than anything else in this function: EVERY check runs before
-    ANY state changes. An earlier version took the phase lock first, so a settlement
-    refused for a bad attestation still left the pool stranded in RESOLVING — unable to
-    collect, with no settlement to show. A refused settlement must be a no-op.
+    Ordering matters more than anything else in this file: EVERY check runs before ANY
+    state changes. An earlier version took the phase lock first, so a settlement refused
+    for a bad attestation still left the pool stranded in RESOLVING — unable to collect,
+    with no settlement to show. A refused settlement must be a no-op.
+
+    Note what is NOT a parameter: an amount, or a destination. Those are computed from
+    PayPal-verified payments and the frozen roster. A caller — model or human — supplies a
+    branch and words, and that is the whole action space.
     """
-    decision = args.get("decision")
     if decision not in ("RELEASE", "UNWIND"):
         raise GuardError("BAD_ARGS", "decision must be RELEASE or UNWIND")
 
@@ -437,7 +442,8 @@ async def _resolve_pool(ctx, args, pool):
     truth = await refresh_from_paypal(ctx, origin="settle")
 
     # 2. Validate everything. Any failure below leaves the pool exactly as it was.
-    guards.check_attestation(args.get("attest") or {}, truth)
+    if attest is not None:
+        guards.check_attestation(attest, truth)
 
     people = {c["cid"]: c for c in await store.get_contributors(ctx.pool_id)}
     invoices = await store.get_invoices(ctx.pool_id)
@@ -460,33 +466,36 @@ async def _resolve_pool(ctx, args, pool):
         payouts_today_cents=await store.payouts_today_cents())
 
     # 3. Only now take the settle lock. A concurrent caller loses here, cleanly.
-    if pool["phase"] == "COLLECTING" and not await store.advance(ctx.pool_id, "COLLECTING", "RESOLVING"):
+    phase = pool["phase"]
+    if phase == "COLLECTING" and not await store.advance(ctx.pool_id, "COLLECTING", "RESOLVING"):
         existing = await store.get_settlement(ctx.pool_id)
         raise GuardError("ALREADY_SETTLED", "this pool is already being settled",
                          batch_id=(existing or {}).get("batch_id"))
+    lock_phase = "RESOLVING" if phase in ("COLLECTING", "RESOLVING") else phase
 
     # 4. Write-ahead the settlement BEFORE any HTTP money call, so a crash mid-flight
     #    cannot turn into a second payout on retry.
     sbid = guards.sender_batch_id(ctx.pool_id, decision)
-    if not await store.insert_settlement(ctx.pool_id, decision=decision,
-                                         reason=args.get("reason", ""),
-                                         policy_quote=args.get("policy_quote", ""),
+    if not await store.insert_settlement(ctx.pool_id, decision=decision, reason=reason,
+                                         policy_quote=policy_quote,
                                          frozen_collected_cents=frozen, sender_batch_id=sbid,
-                                         items=items):
+                                         items=items, decided_by=decided_by):
         existing = await store.get_settlement(ctx.pool_id)
         raise GuardError("ALREADY_SETTLED", "a settlement already exists for this pool",
                          batch_id=(existing or {}).get("batch_id"))
 
     # 5. The decision is committed — it lands on screen alone, before any money moves.
     await ctx.emit("decision", {
-        "decision": decision, "reason": args.get("reason", ""),
-        "policy_quote": args.get("policy_quote", ""),
+        "decision": decision, "reason": reason, "policy_quote": policy_quote,
         "success_condition_restated": pool["success_condition_restated"],
         "collected_cents": frozen, "target_cents": truth["target_cents"],
-        "paid_count": truth["paid_count"], "n": truth["n"], "attested": True, "by": "agent"})
-    await ctx.emit("fact_check", {"matched": True, "model_said": args.get("attest"),
-                                  "paypal_says": {k: truth[k] for k in
-                                                  ("collected_cents", "paid_count", "ledger_version")}})
+        "paid_count": truth["paid_count"], "n": truth["n"],
+        "attested": attest is not None, "by": decided_by})
+    if attest is not None:
+        await ctx.emit("fact_check", {"matched": True, "model_said": attest,
+                                      "paypal_says": {k: truth[k] for k in
+                                                      ("collected_cents", "paid_count",
+                                                       "ledger_version")}})
 
     # 6. Freeze then pay: close the unpaid invoices BEFORE money leaves, so a late payer
     #    cannot pay into a pool that is already being refunded.
@@ -502,8 +511,13 @@ async def _resolve_pool(ctx, args, pool):
             except Exception:  # a stubborn invoice must not block the refunds
                 pass
 
-    await store.advance(ctx.pool_id, "RESOLVING", "SETTLING")
-    await ctx.emit("phase", {"from": "RESOLVING", "to": "SETTLING", "reason": decision})
+    # 7. Record what each payer had paid at the moment of the freeze. Anything that
+    #    arrives after this is a LATE payment, and the ticker returns it with no model
+    #    involved — handing back money that should never have arrived is arithmetic.
+    await store.freeze_paid_snapshot(ctx.pool_id)
+
+    await store.advance(ctx.pool_id, lock_phase, "SETTLING")
+    await ctx.emit("phase", {"from": lock_phase, "to": "SETTLING", "reason": decision})
 
     batch = await ctx.pp.create_payout(
         sbid, [{"email": i["email"], "amount_cents": i["amount_cents"],
@@ -516,11 +530,23 @@ async def _resolve_pool(ctx, args, pool):
         "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
         "items": [{"cid": i["cid"], "name": i["name"], "email_masked": mask_email(i["email"]),
                    "amount_cents": i["amount_cents"]} for i in items],
-        "batch_status": batch.get("batch_status", "PENDING")})
+        "batch_status": batch.get("batch_status", "PENDING"), "by": decided_by})
     return {"batch_id": batch_id, "sender_batch_id": sbid, "kind": decision.lower(),
             "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
             "batch_status": batch.get("batch_status", "PENDING"),
             "invariants_checked": ["conservation", "exact_refunds", "allowlist", "settle_once"]}
+
+
+async def _resolve_pool(ctx, args, pool):
+    """The model's branch. It supplies a decision, its reasoning, the organizer's words
+    that justify it, and an attestation of the numbers it decided on — and nothing else.
+    Read the signature of execute_settlement for what it cannot supply."""
+    return await execute_settlement(
+        ctx, pool, decision=args.get("decision"), reason=args.get("reason", ""),
+        policy_quote=args.get("policy_quote", ""), decided_by="agent",
+        attest=args.get("attest") or {})
+
+
 
 
 async def poll_payout(ctx, args, pool, *, origin: str = "settle"):

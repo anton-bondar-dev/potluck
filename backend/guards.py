@@ -257,6 +257,29 @@ def assert_settlement_valid(*, items: list[dict], frozen_collected_cents: int,
                          f"({settings.daily_payout_cents}c)")
 
 
+def check_late_refund(*, amount_cents: int, to_email: str, payer_email: str,
+                      payouts_today_cents: int) -> None:
+    """A payment that arrived after the pool was frozen goes straight back.
+
+    There is no judgement in this and so no agency: the amount is the difference between
+    what PayPal says they paid and what was frozen for them, and the destination is their
+    own address. Both are facts. The guard exists so that the one code path that moves
+    money without a decision still cannot move the wrong amount or move it anywhere else.
+    """
+    if not isinstance(amount_cents, int) or amount_cents <= 0:
+        raise GuardError("BAD_AMOUNT", f"a late refund must be a positive integer number of "
+                                       f"cents, got {amount_cents!r}")
+    if amount_cents > settings.max_share_cents:
+        raise GuardError("CAP_EXCEEDED",
+                         f"late refund of {amount_cents}c exceeds the per-share ceiling of "
+                         f"{settings.max_share_cents}c")
+    if to_email != payer_email:
+        raise GuardError("RECEIVER_NOT_ALLOWLISTED",
+                         "a late payment can only be returned to the person who made it")
+    if payouts_today_cents + amount_cents > settings.daily_payout_cents:
+        raise GuardError("CAP_EXCEEDED", "this would cross the daily payout ceiling")
+
+
 def allowed_payout_emails(recipient: dict, payers: list[dict]) -> set[str]:
     """G6 layer two: the only payable destinations are the frozen recipient and the
     contributors PayPal confirms actually paid into THIS pool."""
