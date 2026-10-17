@@ -79,7 +79,11 @@ app.add_middleware(
 
 
 # --- rate limiting ----------------------------------------------------------
-_ip_window: dict[str, deque] = defaultdict(deque)
+# One window PER BUCKET per IP. Sharing a single window across endpoints meant the cheap
+# frequent calls (paying, messaging) consumed the allowance for the expensive rare one
+# (creating a pool), so a judge who clicked "pay as Maya" six times could not start a
+# second pool.
+_ip_windows: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
 
 
 def _client_ip(request: Request) -> str:
@@ -95,12 +99,14 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _rate_ok(ip: str, limit: int) -> bool:
+def _rate_ok(bucket: str, ip: str, limit: int) -> bool:
+    """Sliding-minute gate, per bucket per IP. Prunes its own table."""
     now = time.monotonic()
-    if len(_ip_window) > 2048:
-        for k in [k for k, v in _ip_window.items() if not v or now - v[-1] > 60]:
-            _ip_window.pop(k, None)
-    dq = _ip_window[ip]
+    window = _ip_windows[bucket]
+    if len(window) > 2048:
+        for k in [k for k, v in window.items() if not v or now - v[-1] > 60]:
+            window.pop(k, None)
+    dq = window[ip]
     while dq and now - dq[0] > 60:
         dq.popleft()
     if len(dq) >= limit:
@@ -209,7 +215,7 @@ async def get_cast():
 @app.post("/api/pools")
 async def create_pool(body: PoolIn, request: Request):
     ip = _client_ip(request)
-    if not _rate_ok(ip, settings.per_ip_per_min):
+    if not _rate_ok("create", ip, settings.per_ip_per_min):
         raise HTTPException(429, "Too many pools from your network this minute — "
                                  "give it a few seconds.")
     if await store.count_open_pools() >= settings.max_live_pools:
@@ -262,18 +268,29 @@ async def stream_pool(pool_id: str, request: Request, from_seq: int = 0):
             pass
 
     async def gen():
-        async for ev in bus.stream(pool_id, from_seq=from_seq, idle_timeout=HEARTBEAT_S):
-            if ev is None:
-                yield ": hb\n\n"                # keeps proxies from idling the stream out
-                continue
-            # The event name travels INSIDE the payload rather than on an `event:` line:
-            # the client dispatches ~35 types through one reducer, and a named SSE event
-            # would bypass its onmessage handler. `id:` is the line that matters — it is
-            # what makes Last-Event-ID resume work at all.
-            yield f"id: {ev['seq']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
-            if ev["type"] in ("pool_closed", "escalated"):
-                yield f"data: {json.dumps({'type': 'end', 'phase': ev.get('phase', 'CLOSED')})}\n\n"
-                return
+        # The subscription is closed explicitly. A dropped connection closes THIS
+        # generator, which throws GeneratorExit at the yield below — and that does not
+        # propagate into the generator being iterated. Without the aclose() the inner
+        # one stays suspended holding its queue until garbage collection notices, which
+        # is a leaked subscriber on every refresh, every phone that loses signal and
+        # every judge who closes the tab.
+        src = bus.stream(pool_id, from_seq=from_seq, idle_timeout=HEARTBEAT_S)
+        try:
+            async for ev in src:
+                if ev is None:
+                    yield ": hb\n\n"            # keeps proxies from idling the stream out
+                    continue
+                # The event name travels INSIDE the payload rather than on an `event:`
+                # line: the client dispatches ~35 types through one reducer, and a named
+                # SSE event would bypass its onmessage handler. `id:` is the line that
+                # matters — it is what makes Last-Event-ID resume work at all.
+                yield f"id: {ev['seq']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                if ev["type"] in ("pool_closed", "escalated"):
+                    yield ("data: " + json.dumps(
+                        {"type": "end", "phase": ev.get("phase", "CLOSED")}) + "\n\n")
+                    return
+        finally:
+            await src.aclose()
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "X-Accel-Buffering": "no", "Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -287,7 +304,7 @@ async def pay_as(pool_id: str, cid: str, body: PayIn, request: Request):
     invoice, and a merchant-recorded payment — converge on the invoice's own status, so
     the agent cannot tell them apart and nothing in its reasoning depends on which it was.
     """
-    if not _rate_ok(_client_ip(request), settings.per_ip_per_min * 4):
+    if not _rate_ok("pay", _client_ip(request), settings.per_ip_per_min * 4):
         raise HTTPException(429, "slow down a moment")
     pool = await _pool_or_404(pool_id)
     if pool["phase"] not in ("COLLECTING", "RESOLVING"):
@@ -320,7 +337,7 @@ async def pay_as(pool_id: str, cid: str, body: PayIn, request: Request):
 
 @app.post("/api/pools/{pool_id}/message")
 async def message_agent(pool_id: str, body: MessageIn, request: Request):
-    if not _rate_ok(_client_ip(request), settings.per_ip_per_min * 2):
+    if not _rate_ok("message", _client_ip(request), settings.per_ip_per_min * 2):
         raise HTTPException(429, "slow down a moment")
     pool = await _pool_or_404(pool_id)
     if pool["phase"] in ("CLOSED", "ESCALATED"):
