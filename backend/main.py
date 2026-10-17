@@ -17,6 +17,7 @@ import json
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -354,6 +355,26 @@ async def message_agent(pool_id: str, body: MessageIn, request: Request):
     return {"ok": True, "queued": True}
 
 
+def _preflight() -> dict:
+    """What preflight.py last proved, if it has run.
+
+    `paypal_ok` and `payout_ready` on the health endpoint mean a batch actually cleared,
+    not that the code compiled — so they can only come from a run that moved real
+    sandbox money. The age is reported too: a pre-flight from last week is not evidence
+    about today.
+    """
+    path = Path(__file__).with_name("preflight.json")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    at = float(data.get("at") or 0)
+    return {"paypal_ok": data.get("paypal_ok"), "payout_ready": data.get("payout_ready"),
+            "invoice_ok": data.get("invoice_ok"), "groq_keys_ok": data.get("groq_keys_ok"),
+            "preflight_ok": data.get("ok"),
+            "preflight_age_s": int(time.time() - at) if at else None}
+
+
 @app.post("/api/pools/{pool_id}/approve-refund")
 async def approve_refund(pool_id: str, request: Request, body: ApproveIn | None = None):
     """The button on an escalated pool's card. The only way a human moves money here.
@@ -394,12 +415,11 @@ async def healthz():
     """Enough to verify a deploy and to watch the token budget. Key values and model names
     are withheld: they only help an abuser size the quota they would need to drain."""
     meter: agent_core.TokenMeter = state["meter"]
-    pre = state.get("preflight") or {}
+    pre = _preflight()
     return {
         "ok": True,
         "mock": settings.use_mock_paypal,
-        "paypal_ok": pre.get("paypal_ok"),
-        "payout_ready": pre.get("payout_ready"),
+        **pre,
         "groq_keys": len(settings.groq_key_pool()),
         "tokens_remaining_60s": meter.remaining() if meter else None,
         "active_pools": await store.count_open_pools(),

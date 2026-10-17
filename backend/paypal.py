@@ -168,6 +168,12 @@ class PayPalClient:
 
     # --- auth ---------------------------------------------------------------
     async def _access_token(self) -> str:
+        # Mock mode must be network-free for ANY caller, not only for the methods that
+        # happen to branch on self.mock. pre-flight asks for a token directly, and
+        # minting a real one from a test run would make "USE_MOCK_PAYPAL=1 needs no
+        # credentials and no network" quietly false.
+        if self.mock:
+            return "MOCK-TOKEN"
         if self._token and time.monotonic() < self._token_exp - 60:
             return self._token
         auth = base64.b64encode(f"{settings.paypal_client_id}:{settings.paypal_secret}".encode()).decode()
