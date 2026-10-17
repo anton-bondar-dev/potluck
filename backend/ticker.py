@@ -86,6 +86,7 @@ class Ticker:
         self.human_block: dict[str, float] = {}
         self.deadline_fired: set[str] = set()
         self.warned: set[str] = set()
+        self.reached: set[str] = set()
         self.ticks = 0
         self._pool_sem = asyncio.Semaphore(4)
 
@@ -288,6 +289,16 @@ class Ticker:
         if left <= IMMINENT_S and pool["pool_id"] not in self.warned:
             self.warned.add(pool["pool_id"])
             await self.bus.publish(pool["pool_id"], "deadline_imminent", {"time_left_s": left})
+        if left == 0 and pool["pool_id"] not in self.reached:
+            # The beat before the branch: the numbers are what they are, and the agent
+            # has not spoken yet. Fired by code so it lands before the episode does.
+            self.reached.add(pool["pool_id"])
+            snap = await tools.ledger_snapshot(tools.ToolContext(pool["pool_id"], self.pp,
+                                                                 self.bus))
+            await self.bus.publish(pool["pool_id"], "deadline_reached", {
+                "collected_cents": snap["collected_cents"], "target_cents": snap["target_cents"],
+                "paid_count": snap["paid_count"], "n": snap["n"],
+                "shortfall_cents": max(0, snap["target_cents"] - snap["collected_cents"])})
 
     async def _sweep(self, ctx: tools.ToolContext, pid: str) -> tuple[list[dict], dict]:
         """Poll PayPal, write the ledger, stream the drum beat. No LLM.
@@ -405,6 +416,9 @@ class Ticker:
             return False                                  # leave the last word to the agent
         if not await store.advance(pool["pool_id"], "SETTLING", "CLOSED"):
             return False
+        ctx_r = tools.ToolContext(pool["pool_id"], self.pp, self.bus)
+        await self.bus.publish(pool["pool_id"], "receipt",
+                               await tools.build_receipt(ctx_r, pool))
         total = sum(int(i["amount_cents"]) for i in (s.get("items") or []))
         st = s.get("item_statuses") or {}
         tally = ", ".join(f"{n} {k.lower()}" for k, n in

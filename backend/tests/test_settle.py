@@ -64,16 +64,23 @@ async def events(pid, etype=None):
 
 
 async def collecting(pp, b, payers=("c1", "c2", "c3")):
+    """A pool already invoiced and partly paid.
+
+    Everything runs inside bus.pool_scope, the way the ticker and the API run it in
+    production — that is what makes every REST call land on the pool's stream as a
+    paypal_call, which the receipt then counts.
+    """
     pid = await store.create_pool(goal_text="$45 each for Dana's $180 gift by Friday.",
                                   policy_text="Only buy it if we reach $180, else refund.")
     await store.seed_cast(pid, CAST)
     ctx = tools.ToolContext(pid, pp, b)
-    await tools.dispatch(ctx, "plan_pool", PLAN)
-    await tools.dispatch(ctx, "send_invoices", {"cids": ["all"], "item_label": "Gift share"})
-    invs = {i["cid"]: i for i in await store.get_invoices(pid)}
-    for cid in payers:
-        await pp.record_payment(invs[cid]["invoice_id"], 4500)
-    await tools.refresh_from_paypal(ctx)
+    with bus_mod.pool_scope(pid):
+        await tools.dispatch(ctx, "plan_pool", PLAN)
+        await tools.dispatch(ctx, "send_invoices", {"cids": ["all"], "item_label": "Gift share"})
+        invs = {i["cid"]: i for i in await store.get_invoices(pid)}
+        for cid in payers:
+            await pp.record_payment(invs[cid]["invoice_id"], 4500)
+        await tools.refresh_from_paypal(ctx)
     return pid, ctx, invs
 
 
@@ -177,11 +184,12 @@ async def closing_too_early(pp, b):
     await fresh()
     print("\n-- a pool cannot say 'done' before PayPal has --")
     pid, ctx, invs = await collecting(pp, b)
-    truth = await tools.refresh_from_paypal(ctx, include_terminal=True)
-    await tools.execute_settlement(
-        ctx, await store.get_pool(pid), decision="UNWIND", reason="short",
-        policy_quote="give everyone their money back", decided_by="agent",
-        attest={k: truth[k] for k in ("collected_cents", "paid_count", "ledger_version")})
+    with bus_mod.pool_scope(pid):
+        truth = await tools.refresh_from_paypal(ctx, include_terminal=True)
+        await tools.execute_settlement(
+            ctx, await store.get_pool(pid), decision="UNWIND", reason="short",
+            policy_quote="give everyone their money back", decided_by="agent",
+            attest={k: truth[k] for k in ("collected_cents", "paid_count", "ledger_version")})
     s = await store.get_settlement(pid)
     check("the batch starts in flight", s["batch_status"] == "PENDING", s["batch_status"])
 
@@ -197,6 +205,26 @@ async def closing_too_early(pp, b):
     out = await tools.dispatch(ctx, "close_pool", {"summary": "refunds confirmed by PayPal"})
     check("once PayPal reports terminal, closing works", out.get("phase") == "CLOSED", out)
     check("and the pool is CLOSED", (await store.get_pool(pid))["phase"] == "CLOSED")
+
+    receipts = await events(pid, "receipt")
+    check("closing publishes a receipt", len(receipts) == 1, len(receipts))
+    r = receipts[0]
+    check("CONSERVATION: every cent that came in went back out",
+          r["inflow_cents"] == 13500 and r["outflow_cents"] == 13500
+          and r["delta_cents"] == 0, r)
+    check("and it says so in words, not just a number",
+          r["delta_explained"] == "balanced to the cent", r["delta_explained"])
+    check("the ledger is hashed, so two runs are comparable",
+          len(r["ledger_hash"]) == 64, r["ledger_hash"])
+    prov = r["provenance"]
+    check("it carries the real PayPal ids",
+          prov["payout_batch_id"] and len(prov["invoice_ids"]) == 5, prov)
+    check("and what the run actually cost, counted from the log",
+          prov["paypal_calls"] >= 10 and prov["guards_fired"] >= 1,
+          {k: prov[k] for k in ("paypal_calls", "guards_fired", "llm_turns")})
+    check("the invariants it claims are named, not implied",
+          "conservation" in r["invariants_checked"]
+          and "exact_refunds" in r["invariants_checked"], r["invariants_checked"])
 
     for bad, why in (({}, "no settlement"), (None, "nothing settled")):
         try:

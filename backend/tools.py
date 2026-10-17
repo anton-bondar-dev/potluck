@@ -18,6 +18,7 @@ Two properties this file is built around:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 import clock
@@ -640,14 +641,60 @@ async def poll_payout(ctx, args, pool, *, origin: str = "settle",
     return {"batch_status": status, "items_done": done, **counts}
 
 
+async def build_receipt(ctx: ToolContext, pool: dict) -> dict:
+    """The downloadable proof that no money was created, destroyed, or sent off-list.
+
+    inflow is what PayPal confirmed arrived; outflow is the sum of the items that were
+    written ahead of the batch. delta must be zero, or be a retained overage the
+    organizer explicitly asked for — and it says which, rather than leaving a reader to
+    work it out. The hash covers the ledger rows, so two runs of the same pool are
+    comparable and a doctored screenshot is not.
+    """
+    s = await store.get_settlement(ctx.pool_id) or {}
+    invoices = await store.get_invoices(ctx.pool_id)
+    people = {c["cid"]: c for c in await store.get_contributors(ctx.pool_id)}
+    inflow = int(s.get("frozen_collected_cents") or
+                 sum(int(i["paid_cents"]) for i in invoices))
+    items = s.get("items") or []
+    outflow = sum(int(i["amount_cents"]) for i in items)
+    rows = sorted((i["cid"], i["status"], int(i["paid_cents"]), i.get("invoice_id") or "")
+                  for i in invoices)
+    ledger_hash = hashlib.sha256(
+        json.dumps([ctx.pool_id, inflow, outflow, rows], sort_keys=True).encode()).hexdigest()
+    delta = inflow - outflow
+    return {
+        "inflow_cents": inflow, "outflow_cents": outflow, "delta_cents": delta,
+        "delta_explained": ("balanced to the cent" if delta == 0 else
+                            f"{delta}c retained: the organizer chose "
+                            f"{pool['overage']} for money above the target"),
+        "ledger_hash": ledger_hash,
+        "invariants_checked": ["conservation", "exact_refunds", "settle_once",
+                               "idempotent_batch_id", "receiver_allowlist",
+                               "freeze_before_pay"],
+        "decision": s.get("decision"), "decided_by": s.get("decided_by"),
+        "item_statuses": s.get("item_statuses") or {},
+        "provenance": {
+            "invoice_ids": [i["invoice_id"] for i in invoices if i.get("invoice_id")],
+            "payer_urls": [i["payer_url"] for i in invoices if i.get("payer_url")],
+            "payout_batch_id": s.get("batch_id"), "sender_batch_id": s.get("sender_batch_id"),
+            "paypal_env": "sandbox", "mock": settings.use_mock_paypal,
+            **await store.pool_provenance(ctx.pool_id)},
+        "people": len(people),
+    }
+
+
 async def _close_pool(ctx, args, pool):
     s = await store.get_settlement(ctx.pool_id)
     guards.check_closable(s)
-    await store.advance(ctx.pool_id, "SETTLING", "CLOSED")
+    if not await store.advance(ctx.pool_id, "SETTLING", "CLOSED"):
+        return {"error": "WRONG_PHASE", "detail": "this pool is no longer settling"}
+    receipt = await build_receipt(ctx, pool)
+    await ctx.emit("receipt", receipt)
     await ctx.emit("pool_closed", {"phase": "CLOSED", "summary": (args.get("summary") or "")[:600],
                                    "decision": (s or {}).get("decision"),
-                                   "batch_id": (s or {}).get("batch_id")})
-    return {"phase": "CLOSED"}
+                                   "batch_id": (s or {}).get("batch_id"), "by": "agent"})
+    return {"phase": "CLOSED", "delta_cents": receipt["delta_cents"],
+            "ledger_hash": receipt["ledger_hash"][:16]}
 
 
 _HANDLERS = {

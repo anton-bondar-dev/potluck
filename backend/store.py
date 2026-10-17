@@ -575,6 +575,33 @@ async def last_settlement_at() -> float | None:
     return row["t"] if row and row["t"] else None
 
 
+async def pool_provenance(pool_id: str) -> dict:
+    """What this pool cost and what it touched, counted from the log itself.
+
+    Everything here is derived from rows the system wrote while it ran, not from a
+    tally kept alongside — so the receipt cannot drift from what happened.
+    """
+    cur = await db().execute(
+        "SELECT type, data FROM events WHERE pool_id=? AND type IN "
+        "('paypal_call','model_turn','guard_block','episode_start')", (pool_id,))
+    calls = turns = prompt = completion = guards_fired = episodes = 0
+    for r in await cur.fetchall():
+        if r["type"] == "paypal_call":
+            calls += 1
+        elif r["type"] == "guard_block":
+            guards_fired += 1
+        elif r["type"] == "episode_start":
+            episodes += 1
+        else:
+            d = json.loads(r["data"])
+            turns += 1
+            prompt += int(d.get("prompt_tokens") or 0)
+            completion += int(d.get("completion_tokens") or 0)
+    return {"paypal_calls": calls, "llm_turns": turns, "episodes": episodes,
+            "prompt_tokens": prompt, "completion_tokens": completion,
+            "guards_fired": guards_fired}
+
+
 async def prune_events(older_than_s: float = 86400 * 2) -> int:
     cutoff = time.time() - older_than_s
     async with _write_lock:
