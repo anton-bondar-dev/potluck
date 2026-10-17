@@ -226,13 +226,13 @@ async def advance(pool_id: str, frm: str, to: str) -> bool:
 
 async def set_plan(pool_id: str, *, success_condition_restated: str, recipient_cid: str,
                    target_cents: int, deadline_at: float, deadline_label: str,
-                   overage: str) -> None:
+                   overage: str, clock_scale: int = 1) -> None:
     async with _write_lock:
         await db().execute(
             "UPDATE pools SET success_condition_restated=?, recipient_cid=?, target_cents=?, "
-            "deadline_at=?, deadline_label=?, overage=? WHERE pool_id=?",
+            "deadline_at=?, deadline_label=?, overage=?, clock_scale=? WHERE pool_id=?",
             (success_condition_restated, recipient_cid, target_cents, deadline_at,
-             deadline_label, overage, pool_id),
+             deadline_label, overage, int(clock_scale), pool_id),
         )
         await db().commit()
 

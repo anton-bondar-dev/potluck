@@ -260,12 +260,28 @@ async def _plan_pool(ctx, args, pool):
         raise GuardError("BAD_ARGS", "overage must be refund_prorata or keep_to_target")
 
     shares = {c["cid"]: int(c["share_cents"]) for c in contributors}
-    deadline_at = clock.now() + int(horizon)
+
+    # ONE CLOCK, and this is the only place it is set.
+    #
+    # The model reads "by Friday" and asks for three days, which is the right answer to
+    # the question it was asked — and useless for a demo nobody will watch for three
+    # days. So a demo pool's REAL horizon is compressed to demo_horizon_s and the scale
+    # is derived from the ratio, which means the countdown on screen renders exactly the
+    # span the model asked for. Nothing is hidden: the scale is published in
+    # pool_created, shown as a badge, and the model is told in this tool's own result.
+    #
+    # Deriving the scale rather than fixing it at 2880 also keeps it honest for any
+    # horizon — a model that asks for two minutes gets a scale of 1 and no compression.
+    asked_horizon = int(horizon)
+    real_horizon = (min(asked_horizon, settings.demo_horizon_s) if pool["demo"]
+                    else asked_horizon)
+    scale = max(1, round(asked_horizon / real_horizon)) if real_horizon else 1
+    deadline_at = clock.now() + real_horizon
     await store.apply_plan(ctx.pool_id, shares=shares, recipient_cid=recipient_cid)
     await store.set_plan(ctx.pool_id,
                          success_condition_restated=args["success_condition_restated"],
                          recipient_cid=recipient_cid, target_cents=int(target),
-                         deadline_at=deadline_at,
+                         deadline_at=deadline_at, clock_scale=scale,
                          deadline_label=args.get("deadline_label", ""), overage=overage)
     await store.advance(ctx.pool_id, "DRAFT", "COLLECTING")
 
@@ -279,11 +295,20 @@ async def _plan_pool(ctx, args, pool):
     await ctx.emit("phase", {"from": "DRAFT", "to": "COLLECTING", "reason": "planned"})
 
     left = clock.time_left_s(deadline_at)
-    return {"pool_id": ctx.pool_id, "n": len(shares), "sum_shares_cents": sum(shares.values()),
-            "target_cents": int(target), "slack_cents": sum(shares.values()) - int(target),
-            "time_left_s": left,
-            "time_left_label": clock.display_label(left, int(pool["clock_scale"])),
-            "checks_passed": ["cids_in_cast", "split_covers_target", "caps_ok"]}
+    out = {"pool_id": ctx.pool_id, "n": len(shares), "sum_shares_cents": sum(shares.values()),
+           "target_cents": int(target), "slack_cents": sum(shares.values()) - int(target),
+           "time_left_s": left, "time_left_label": clock.display_label(left, scale),
+           "clock_scale": scale,
+           "checks_passed": ["cids_in_cast", "split_covers_target", "caps_ok"]}
+    if scale > 1:
+        # Told plainly, because the model must keep sleeping in REAL seconds while
+        # talking to humans in the span they asked for.
+        out["note"] = (f"This is a demo pool, so the {asked_horizon}s you asked for runs in "
+                       f"{real_horizon}s of real time and the countdown on screen renders it "
+                       f"as {clock.display_label(left, scale)}. Everything you are told about "
+                       f"time, and every sleep you request, is in REAL seconds — you have "
+                       f"{left} of them. Quote the long span to people; reason in the short one.")
+    return out
 
 
 async def _send_invoices(ctx, args, pool):

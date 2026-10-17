@@ -5,7 +5,7 @@ Run: USE_MOCK_PAYPAL=1 ./.venv/bin/python tests/test_tools.py
 import asyncio, os, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import store, tools  # noqa: E402
+import clock, store, tools  # noqa: E402
 from bus import EventBus  # noqa: E402
 from paypal import get_paypal_client  # noqa: E402
 
@@ -132,10 +132,47 @@ async def main():
     check("the decision event carries the model's own words and a policy quote",
           dec["policy_quote"].startswith("If we fall short") and dec["attested"] is True, dec)
 
+    await demo_clock(pp, b)
+
     await store.close_db()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", ", ".join(FAIL)); sys.exit(1)
+
+
+async def demo_clock(pp, b):
+    """ONE CLOCK, and the only place it is set.
+
+    The model reads "by Friday" and asks for three days, which is the right answer to the
+    question it was asked and useless for a demo nobody will watch for three days. A demo
+    pool compresses the REAL horizon and derives the display scale from the ratio, so the
+    countdown renders exactly the span the model asked for. Without this the pool's
+    climax is three days away and the film cannot exist.
+    """
+    print("\n-- the demo clock --")
+    for demo, asked, want_real, want_scale in ((True, 259200, 90, 2880),
+                                               (False, 259200, 259200, 1),
+                                               (True, 60, 60, 1)):
+        pid = await store.create_pool(goal_text="Three days of chipping in for a gift.",
+                                      policy_text="Reach the target or refund.", demo=demo)
+        await store.seed_cast(pid, CAST)
+        ctx = tools.ToolContext(pid, pp, b)
+        r = await tools.dispatch(ctx, "plan_pool", {
+            "restatement": "x", "success_condition_restated": "y", "recipient_cid": "rec",
+            "target_cents": 18000, "deadline_label": "Friday 9am", "horizon_seconds": asked,
+            "contributors": [{"cid": f"c{i}", "share_cents": 4500} for i in range(5)]})
+        tag = f"demo={demo} asked={asked}s"
+        check(f"{tag}: the real deadline is {want_real}s away",
+              abs(r["time_left_s"] - want_real) <= 2, r.get("time_left_s") or r)
+        check(f"{tag}: the scale is {want_scale}", r["clock_scale"] == want_scale, r)
+        label = clock.display_label(r["time_left_s"], r["clock_scale"])
+        check(f"{tag}: the countdown still renders what was asked for",
+              label == clock.human_label(asked) or abs(
+                  clock.display_left_s(r["time_left_s"], r["clock_scale"]) - asked) < asked * 0.05,
+              (label, clock.human_label(asked)))
+        check(f"{tag}: compression is disclosed to the model" if want_scale > 1
+              else f"{tag}: no compression, nothing to disclose",
+              bool(r.get("note")) == (want_scale > 1), r.get("note"))
 
 
 if __name__ == "__main__":
