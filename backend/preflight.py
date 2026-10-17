@@ -242,22 +242,37 @@ async def check_http(rep: Report, base: str) -> None:
             rep.add("http: SSE", BAD, f"could not create a pool: {pool.status_code} {pool.text[:90]}")
             return
         pid = pool.json()["pool_id"]
-        got, t0 = [], time.monotonic()
+        got, t0, first_at = [], time.monotonic(), None
         try:
             async with c.stream("GET", f"{base}/api/pools/{pid}/stream") as r:
-                rep.add("http: SSE headers", OK if r.headers.get("x-accel-buffering") == "no" else BAD,
-                        f"content-type={r.headers.get('content-type')} "
-                        f"x-accel-buffering={r.headers.get('x-accel-buffering')}")
+                ctype = r.headers.get("content-type", "")
+                accel = r.headers.get("x-accel-buffering")
+                # nginx CONSUMES X-Accel-Buffering — it is an instruction to the proxy,
+                # not a header for the client — so its absence here means the proxy read
+                # it. Asserting it reaches the browser would fail on a correct deploy.
+                rep.add("http: SSE content type", OK if "text/event-stream" in ctype else BAD,
+                        f"{ctype}" + (" · X-Accel-Buffering passed through (no proxy in front)"
+                                      if accel else " · X-Accel-Buffering consumed by the proxy"))
                 async for line in r.aiter_lines():
                     if line.startswith("data: "):
+                        if first_at is None:
+                            first_at = time.monotonic() - t0
                         got.append(json.loads(line[6:]).get("type"))
                     if got and time.monotonic() - t0 > 4:
                         break
         except Exception as exc:                          # noqa: BLE001
             rep.add("http: SSE", BAD, f"{type(exc).__name__}: {str(exc)[:120]}")
             return
+        # The real test for buffering is behavioural: a buffering proxy holds everything
+        # until its buffer fills or the response ends, and an SSE response never ends. So
+        # a frame arriving promptly IS the proof, and a header cannot give it.
         rep.add("http: SSE streams through the proxy", OK if got else BAD,
                 f"{len(got)} frames in {time.monotonic() - t0:.1f}s: {got[:4]}")
+        rep.add("http: SSE is not buffered",
+                OK if first_at is not None and first_at < 2.0 else BAD,
+                f"first frame after {first_at:.2f}s" if first_at is not None
+                else "no frame arrived at all")
+        rep.facts["sse_first_frame_s"] = first_at
         rep.facts["sse_frames"] = got[:12]
 
 
