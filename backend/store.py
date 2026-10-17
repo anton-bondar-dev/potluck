@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS settlements (
   sender_batch_id TEXT NOT NULL,
   batch_id  TEXT,
   batch_status TEXT,
+  item_statuses_json TEXT,
   items_json TEXT NOT NULL,
   decided_by TEXT NOT NULL DEFAULT 'agent',
   created_at REAL NOT NULL
@@ -136,6 +137,7 @@ _write_lock = asyncio.Lock()
 # idempotently at boot.
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("invoices", "settled_cents", "INTEGER NOT NULL DEFAULT 0"),
+    ("settlements", "item_statuses_json", "TEXT"),
 ]
 
 
@@ -144,6 +146,8 @@ async def _migrate(conn: aiosqlite.Connection) -> list[str]:
     for table, column, decl in MIGRATIONS:
         cur = await conn.execute(f"PRAGMA table_info({table})")
         have = {r["name"] for r in await cur.fetchall()}
+        if not have:
+            continue        # the table does not exist here; SCHEMA will have created it
         if column not in have:
             await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
             applied.append(f"{table}.{column}")
@@ -456,11 +460,24 @@ async def insert_settlement(pool_id: str, *, decision: str, reason: str, policy_
             return False
 
 
-async def set_settlement_batch(pool_id: str, batch_id: str, batch_status: str) -> None:
+async def set_settlement_batch(pool_id: str, batch_id: str, batch_status: str,
+                               item_statuses: dict | None = None) -> None:
+    """Record what PayPal last said about the batch — header AND per item.
+
+    The header lags: a live batch sat at PROCESSING for tens of seconds after every one
+    of its items had already reported SUCCESS. Judging completion from the header meant
+    the pool never closed, so the items are stored too and they are what counts.
+    """
     async with _write_lock:
-        await db().execute(
-            "UPDATE settlements SET batch_id=?, batch_status=? WHERE pool_id=?",
-            (batch_id, batch_status, pool_id))
+        if item_statuses is None:
+            await db().execute(
+                "UPDATE settlements SET batch_id=?, batch_status=? WHERE pool_id=?",
+                (batch_id, batch_status, pool_id))
+        else:
+            await db().execute(
+                "UPDATE settlements SET batch_id=?, batch_status=?, item_statuses_json=? "
+                "WHERE pool_id=?",
+                (batch_id, batch_status, json.dumps(item_statuses), pool_id))
         await db().commit()
 
 
@@ -471,6 +488,7 @@ async def get_settlement(pool_id: str) -> dict | None:
         return None
     d = dict(row)
     d["items"] = json.loads(d.pop("items_json") or "[]")
+    d["item_statuses"] = json.loads(d.pop("item_statuses_json", None) or "{}")
     return d
 
 

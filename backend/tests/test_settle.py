@@ -47,6 +47,17 @@ PLAN = {"restatement": "Five chip in $45 each.",
         "contributors": [{"cid": f"c{i}", "share_cents": 4500} for i in range(1, 6)]}
 
 
+async def fresh():
+    """A new database per scenario.
+
+    tick_once() serves every live pool, so a pool left settling by an earlier scenario
+    would be woken inside a later one — correct behaviour for the product, and a
+    cross-contaminated assertion in a test.
+    """
+    await store.close_db()
+    await store.init_db(os.path.join(tempfile.mkdtemp(), "settle.db"))
+
+
 async def events(pid, etype=None):
     evs = await store.read_events(pid)
     return [e for e in evs if etype is None or e["type"] == etype]
@@ -108,6 +119,7 @@ async def one_path():
 
 
 async def late_payments(pp, b):
+    await fresh()
     print("\n-- a payment that arrives too late --")
     pid, ctx, invs = await collecting(pp, b)
     truth = await tools.refresh_from_paypal(ctx)
@@ -162,6 +174,7 @@ async def late_payments(pp, b):
 
 
 async def closing_too_early(pp, b):
+    await fresh()
     print("\n-- a pool cannot say 'done' before PayPal has --")
     pid, ctx, invs = await collecting(pp, b)
     truth = await tools.refresh_from_paypal(ctx, include_terminal=True)
@@ -194,6 +207,7 @@ async def closing_too_early(pp, b):
 
 
 async def human_refund(pp, b):
+    await fresh()
     print("\n-- the human-approved refund on an escalated pool --")
     pid, ctx, invs = await collecting(pp, b)
     llm = CountingLLM()
@@ -251,12 +265,14 @@ async def human_refund(pp, b):
     check("and says plainly that the system did it, not the agent",
           closed and closed[-1]["by"] == "system" and closed[-1]["decided_by"] == "human",
           closed[-1:])
-    check("the summary states only what PayPal reported",
-          "SUCCESS" in closed[-1]["summary"], closed[-1]["summary"])
+    check("the summary states only what PayPal reported, item by item",
+          "success" in closed[-1]["summary"].lower()
+          and "PayPal reports" in closed[-1]["summary"], closed[-1]["summary"])
     check("still with no model turn spent", llm.n == 0, llm.n)
 
 
 async def agent_keeps_the_last_word(pp, b):
+    await fresh()
     print("\n-- the agent still closes its own pools --")
     pid, ctx, invs = await collecting(pp, b, payers=("c1", "c2", "c3", "c4", "c5"))
     truth = await tools.refresh_from_paypal(ctx)
@@ -273,6 +289,34 @@ async def agent_keeps_the_last_word(pp, b):
     check("code does NOT close a pool whose agent can still speak", not closed)
     check("the pool stays in SETTLING for it",
           (await store.get_pool(pid))["phase"] == "SETTLING")
+
+
+async def batch_completion():
+    print("\n-- when is a batch actually finished --")
+    # The bug this exists to prevent: a live batch reported PROCESSING in its header for
+    # tens of seconds AFTER both of its items had reported SUCCESS. Judging completion on
+    # the header meant the pool never closed and the agent was never woken to say so.
+    lagging = {"batch_status": "PROCESSING", "item_statuses": {"c1": "SUCCESS", "c2": "SUCCESS"}}
+    check("a lagging header does not keep a finished batch open",
+          guards.batch_is_done(lagging))
+    check("a genuinely pending item does keep it open",
+          not guards.batch_is_done({"batch_status": "SUCCESS",
+                                    "item_statuses": {"c1": "SUCCESS", "c2": "PENDING"}}))
+    check("an unclaimed item is terminal — thirty days is not a wait we can take",
+          guards.batch_is_done({"batch_status": "PROCESSING",
+                                "item_statuses": {"c1": "SUCCESS", "c2": "UNCLAIMED"}}))
+    check("a failed item is terminal too",
+          guards.batch_is_done({"batch_status": "PROCESSING",
+                                "item_statuses": {"c1": "FAILED"}}))
+    check("with no item detail yet, the header is all there is",
+          guards.batch_is_done({"batch_status": "SUCCESS", "item_statuses": {}})
+          and not guards.batch_is_done({"batch_status": "PENDING", "item_statuses": {}}))
+    check("and nothing at all is not done", not guards.batch_is_done(None))
+    try:
+        guards.check_closable(lagging)
+        check("closing is allowed once the items are terminal", True)
+    except guards.GuardError as exc:
+        check("closing is allowed once the items are terminal", False, exc.code)
 
 
 async def migration():
@@ -304,6 +348,7 @@ async def main_test():
         await closing_too_early(pp, b)
         await human_refund(pp, b)
         await agent_keeps_the_last_word(pp, b)
+        await batch_completion()
         await migration()
     await store.close_db()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

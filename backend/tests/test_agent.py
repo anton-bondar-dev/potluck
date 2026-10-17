@@ -340,8 +340,8 @@ async def lifecycle(pp, b):
     r4 = await run_episode(pool_id=pid, trigger="payout", pp=pp, llm=llm4, meter=meter, bus=b)
     check("the final episode ends done", r4.ran and r4.reason == "done", r4)
     check("the pool is CLOSED", (await store.get_pool(pid))["phase"] == "CLOSED")
-    check("the SETTLING menu is only the two settling tools",
-          set(llm4.menus[0]) == {"check_payout", "close_pool"}, llm4.menus[0])
+    check("the SETTLING menu is check, wait, close — waiting has to be choosable",
+          set(llm4.menus[0]) == {"check_payout", "sleep_until", "close_pool"}, llm4.menus[0])
     check("a closed pool refuses another episode",
           (await run_episode(pool_id=pid, trigger="tick", pp=pp, llm=ScriptedLLM([]),
                              meter=meter, bus=b)).reason == "terminal_phase")

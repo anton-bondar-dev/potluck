@@ -261,6 +261,27 @@ def assert_settlement_valid(*, items: list[dict], frozen_collected_cents: int,
 # batch; that is reported per item on the receipt rather than hidden.
 TERMINAL_BATCH_STATUSES = {"SUCCESS", "DENIED", "CANCELED", "CANCELLED"}
 
+# Per-item states PayPal will not move off on its own. UNCLAIMED is in here on purpose:
+# an item sent to an address with no PayPal account sits unclaimed for thirty days, and
+# waiting that out is not an option — so it is terminal for the purpose of closing, and
+# reported as its own count so nothing ever claims the refund completed.
+TERMINAL_ITEM_STATUSES = {"SUCCESS", "FAILED", "BLOCKED", "RETURNED", "REFUNDED",
+                          "REVERSED", "DENIED", "UNCLAIMED"}
+
+
+def batch_is_done(settlement: dict | None) -> bool:
+    """Has PayPal finished with this batch?
+
+    Judged on the ITEMS, because the batch header lags behind them — a live batch
+    reported PROCESSING long after both of its items had reported SUCCESS.
+    """
+    if not settlement:
+        return False
+    items = settlement.get("item_statuses") or {}
+    if items:
+        return all(v in TERMINAL_ITEM_STATUSES for v in items.values())
+    return (settlement.get("batch_status") or "PENDING") in TERMINAL_BATCH_STATUSES
+
 
 def check_closable(settlement: dict | None) -> None:
     """A pool may not be closed while the payout is still in flight.
@@ -273,11 +294,13 @@ def check_closable(settlement: dict | None) -> None:
     if not settlement:
         raise GuardError("NOT_SETTLED", "nothing has been settled, so there is nothing to close")
     status = settlement.get("batch_status") or "PENDING"
-    if status not in TERMINAL_BATCH_STATUSES:
+    if not batch_is_done(settlement):
         raise GuardError("PAYOUT_NOT_TERMINAL",
-                         f"the payout batch is still {status}. Call check_payout until PayPal "
-                         f"reports a terminal status, then close — do not tell anyone the "
-                         f"money has arrived before it has.", batch_status=status)
+                         f"the payout batch is still {status}, which takes PayPal around "
+                         f"30 seconds. Call sleep_until to wait — you will be woken when the "
+                         f"batch reaches a terminal state — then check_payout and close. Do "
+                         f"not tell anyone the money has arrived before it has.",
+                         batch_status=status)
 
 
 def check_late_refund(*, amount_cents: int, to_email: str, payer_email: str,

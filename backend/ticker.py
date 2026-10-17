@@ -138,8 +138,10 @@ class Ticker:
             self.nudged[pid] = {i["cid"] for i in invoices if int(i["reminders"] or 0) > 0}
             if await self._restore_sleep(pid):
                 resumed += 1
-            if pool["phase"] == "SETTLING" and await self._reconcile(pool):
-                reconciled += 1
+            if pool["phase"] == "SETTLING":
+                await self._reconcile(pool)
+                if (await store.get_settlement(pid) or {}).get("batch_id"):
+                    reconciled += 1
         await store.prune_events()
         return {"pools": len(pools), "reclaimed": reclaimed, "sleeps_restored": resumed,
                 "batches_reconciled": reconciled}
@@ -164,14 +166,23 @@ class Ticker:
         return True
 
     async def _reconcile(self, pool: dict) -> bool:
-        """Read an in-flight payout batch back. By GET — never by re-POST."""
-        s = await store.get_settlement(pool["pool_id"])
-        if not s or not s.get("batch_id") or s.get("batch_status") == "SUCCESS":
+        """Read an in-flight payout batch back. By GET — never by re-POST.
+
+        Returns True when the batch reached a terminal state ON THIS PASS, which is the
+        moment the agent has something new to say. Waking it two seconds after it
+        submitted the batch, as an earlier version did, just had it poll a PENDING batch
+        and try to close against a guard until its turns ran out.
+        """
+        pid = pool["pool_id"]
+        s = await store.get_settlement(pid)
+        if not s or not s.get("batch_id"):
             return False
-        ctx = tools.ToolContext(pool["pool_id"], self.pp, self.bus)
-        with bus_mod.pool_scope(pool["pool_id"]):
-            await tools.poll_payout(ctx, {}, pool, origin="ticker")
-        return True
+        if guards.batch_is_done(s):
+            return False
+        ctx = tools.ToolContext(pid, self.pp, self.bus)
+        with bus_mod.pool_scope(pid):
+            await tools.poll_payout(ctx, {}, pool, origin="ticker", only_changes=True)
+        return guards.batch_is_done(await store.get_settlement(pid))
 
     # --- one pass -----------------------------------------------------------
     async def tick_once(self) -> list[dict]:
@@ -228,10 +239,12 @@ class Ticker:
         # 3. An in-flight batch resolves itself, with no model turn spent on watching it,
         #    and anything that arrived after the freeze goes straight back.
         if phase == "SETTLING":
-            await self._reconcile(pool)
+            just_terminal = await self._reconcile(pool)
             await self._late_sweep(ctx, pool)
             if await self._auto_close(ctx, pool):
                 return {"pool_id": pid, "action": "closed"}
+            if just_terminal:
+                self.wake_at[pid] = 0.0           # now the agent has something to report
 
         # 4. Freeze rather than guess: past the deadline AND past the grace, a pool that
         #    still has not been resolved goes to a human. Code does not decide for it.
@@ -384,7 +397,7 @@ class Ticker:
         say it; it still cannot decide anything, because everything is already decided.
         """
         s = await store.get_settlement(pool["pool_id"])
-        if not s or s.get("batch_status") != "SUCCESS":
+        if not guards.batch_is_done(s):
             return False
         agent_can_act = (int(pool["episodes_used"]) < settings.max_episodes
                          and s.get("decided_by") == "agent")
@@ -393,12 +406,16 @@ class Ticker:
         if not await store.advance(pool["pool_id"], "SETTLING", "CLOSED"):
             return False
         total = sum(int(i["amount_cents"]) for i in (s.get("items") or []))
+        st = s.get("item_statuses") or {}
+        tally = ", ".join(f"{n} {k.lower()}" for k, n in
+                          sorted({v: list(st.values()).count(v) for v in set(st.values())}.items()))
         await self.bus.publish(pool["pool_id"], "phase", {
             "from": "SETTLING", "to": "CLOSED", "reason": "batch settled"})
         await self.bus.publish(pool["pool_id"], "pool_closed", {
             "phase": "CLOSED", "by": "system",
-            "summary": f"{s['decision']} completed: {len(s.get('items') or [])} payout item(s), "
-                       f"{total} cents, batch {s.get('batch_id')} reported SUCCESS by PayPal.",
+            "summary": f"{s['decision']}: {len(s.get('items') or [])} payout item(s), "
+                       f"{total} cents, batch {s.get('batch_id')} — PayPal reports "
+                       f"{tally or s.get('batch_status')}.",
             "decided_by": s.get("decided_by")})
         self.wake_at.pop(pool["pool_id"], None)
         return True
@@ -484,7 +501,9 @@ class Ticker:
         elif res.reason == "tpm":
             self.wake_at[pid] = time.time() + max(1, res.retry_in_s)
         elif res.reason == "settled":
-            self.wake_at[pid] = time.time() + 2           # the batch needs a moment
+            # A fallback only: the pass that sees the batch terminalise pulls this in.
+            # Polling a batch PayPal has not finished with costs turns and says nothing.
+            self.wake_at[pid] = time.time() + 120
         else:
             self.wake_at[pid] = time.time() + RETRY_AFTER_S
 

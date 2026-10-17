@@ -166,7 +166,11 @@ def menu_for_phase(phase: str, *, deadline_reached: bool = False,
     elif phase == "RESOLVING":
         names = ["check_payments", "resolve_pool"]
     elif phase == "SETTLING":
-        names = ["check_payout", "close_pool"]
+        # sleep_until belongs here. Without it a model watching a PENDING batch has only
+        # two legal moves — poll again (a no-op) or close (refused until PayPal is
+        # terminal) — so it spins through its whole turn budget. A real batch takes
+        # 25-30 seconds; waiting has to be something it can actually choose.
+        names = ["check_payout", "sleep_until", "close_pool"]
     else:
         names = []
     return [SCHEMAS[n] for n in names]
@@ -583,7 +587,8 @@ async def _resolve_pool(ctx, args, pool):
 
 
 
-async def poll_payout(ctx, args, pool, *, origin: str = "settle"):
+async def poll_payout(ctx, args, pool, *, origin: str = "settle",
+                      only_changes: bool = False):
     """Read the batch back from PayPal and stream the per-item cascade.
 
     Public and shared: the model reaches it as `check_payout`, and the ticker calls it
@@ -598,29 +603,41 @@ async def poll_payout(ctx, args, pool, *, origin: str = "settle"):
     header = body.get("batch_header") or {}
     items = body.get("items") or []
     status = header.get("batch_status", "PENDING")
-    await store.set_settlement_batch(ctx.pool_id, s["batch_id"], status)
     # Join back to the write-ahead item list: PayPal answers by receiver address, the
     # ledger grid needs a cid to flash the right row.
     planned = {i["email"]: i for i in (s.get("items") or [])}
+    was = s.get("item_statuses") or {}
     counts = {"SUCCESS": 0, "PENDING": 0, "UNCLAIMED": 0, "FAILED": 0}
+    now: dict[str, str] = {}
+    changed = []
     for it in items:
         st = it.get("transaction_status", "PENDING")
         counts[st] = counts.get(st, 0) + 1
         pi = it.get("payout_item") or {}
         who = planned.get(pi.get("receiver", ""), {})
-        await ctx.emit("payout_item", {
-            "batch_id": s["batch_id"], "cid": who.get("cid"), "name": who.get("name"),
-            "email_masked": mask_email(pi.get("receiver", "")),
-            "amount_cents": who.get("amount_cents") or str_to_cents(
-                (pi.get("amount") or {}).get("value", 0)),
-            "item_status": st, "transaction_id": it.get("transaction_id")})
-    await ctx.emit("payout_settled", {"batch_id": s["batch_id"], "batch_status": status,
-                                      "succeeded": counts.get("SUCCESS", 0),
-                                      "pending": counts.get("PENDING", 0),
-                                      "unclaimed": counts.get("UNCLAIMED", 0),
-                                      "failed": counts.get("FAILED", 0),
-                                      "total_cents": s["frozen_collected_cents"]})
-    return {"batch_status": status, **counts}
+        key = who.get("cid") or pi.get("receiver", "")
+        now[key] = st
+        if was.get(key) != st:
+            changed.append(key)
+        # The ticker polls this every couple of seconds for half a minute. Re-sending an
+        # identical PENDING frame ten times is noise on the wire and in the log, and the
+        # cascade is supposed to be legible: one frame per item per actual transition.
+        if not only_changes or key in changed:
+            await ctx.emit("payout_item", {
+                "batch_id": s["batch_id"], "cid": who.get("cid"), "name": who.get("name"),
+                "email_masked": mask_email(pi.get("receiver", "")),
+                "amount_cents": who.get("amount_cents") or str_to_cents(
+                    (pi.get("amount") or {}).get("value", 0)),
+                "item_status": st, "transaction_id": it.get("transaction_id")})
+    await store.set_settlement_batch(ctx.pool_id, s["batch_id"], status, now)
+    done = guards.batch_is_done({**s, "item_statuses": now, "batch_status": status})
+    if changed or not only_changes:
+        await ctx.emit("payout_settled", {
+            "batch_id": s["batch_id"], "batch_status": status, "items_done": done,
+            "succeeded": counts.get("SUCCESS", 0), "pending": counts.get("PENDING", 0),
+            "unclaimed": counts.get("UNCLAIMED", 0), "failed": counts.get("FAILED", 0),
+            "total_cents": s["frozen_collected_cents"]})
+    return {"batch_status": status, "items_done": done, **counts}
 
 
 async def _close_pool(ctx, args, pool):
