@@ -1,0 +1,11 @@
+{
+  "comment": "The frozen sandbox cast. The model refers to people by cid and can never introduce an email address, which is what stops a public demo being driven to invoice a stranger. These are PayPal sandbox test accounts, each verified as a payout receiver on 2026-10-16 — see planning/sandbox-accounts.md.",
+  "people": [
+    {"cid": "c1", "name": "Maya",  "email": "sb-8go7k53393165@personal.example.com"},
+    {"cid": "c2", "name": "Sam",   "email": "sb-qs4xf53393163@personal.example.com"},
+    {"cid": "c3", "name": "Priya", "email": "sb-yqgtl53392034@personal.example.com"},
+    {"cid": "c4", "name": "Theo",  "email": "sb-la4xd53392033@personal.example.com"},
+    {"cid": "c5", "name": "Noor",  "email": "sb-qwvhc53391992@personal.example.com"},
+    {"cid": "r1", "name": "Dana",  "email": "sb-vjoct53392028@personal.example.com"}
+  ]
+}
