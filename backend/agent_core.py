@@ -237,8 +237,45 @@ def _roster_lines(people: list[dict], invoices: dict[str, dict]) -> list[str]:
     return out
 
 
+def _settlement_block(s: dict | None) -> list[str]:
+    """What was already decided, and by whom.
+
+    Without this the closing episode starts cold: it sees a SETTLING pool, a roster and a
+    policy, and re-derives the decision from scratch. A live run did exactly that and
+    wrote a closing summary saying the pool had been UNWOUND while the batch on screen
+    was a RELEASE — the agent contradicting itself in the final frame, which is the one
+    place it cannot afford to. The decision is history by this point, not a question.
+    """
+    if not s:
+        return []
+    statuses = s.get("item_statuses") or {}
+    tally = ", ".join(f"{k} {v.lower()}" for k, v in sorted(statuses.items())) or "not reported yet"
+    items = s.get("items") or []
+    total = sum(int(i["amount_cents"]) for i in items)
+    who = s.get("decided_by") or "agent"
+    out = [
+        "",
+        "ALREADY DECIDED — settled history, not a question to reopen:",
+        f"  The branch taken was {s['decision']}" + ("" if who == "agent" else f", by a {who}"),
+        f"  The stated reason was: {(s.get('reason') or '').strip()}",
+    ]
+    if s.get("policy_quote"):
+        out.append(f"  The organizer's words quoted for it: {(s['policy_quote']).strip()}")
+    out += [
+        f"  Payout batch {s.get('batch_id') or '(not submitted yet)'}: {len(items)} item(s), "
+        f"{_money(total)} in total.",
+        f"  PayPal reports per item: {tally}.",
+        "  What is left for you is to confirm the money landed and write the closing "
+        "summary for the people involved. Describe THAT outcome — do not announce a "
+        "different one.",
+    ]
+    return out
+
+
+
+
 def build_brief(pool: dict, people: list[dict], invoices: list[dict], snap: dict,
-                trigger: str) -> str:
+                trigger: str, settlement: dict | None = None) -> str:
     """The one user message that opens a fresh episode.
 
     The organizer's goal and success condition go in verbatim, inside delimiters, declared
@@ -268,6 +305,8 @@ def build_brief(pool: dict, people: list[dict], invoices: list[dict], snap: dict
             f"organizer's clock) · ledger_version {snap['ledger_version']}")
         if snap["deadline_reached"]:
             parts.append("The deadline has passed. You are expected to decide.")
+    parts += [p for p in _settlement_block(settlement) if p != ""] if settlement else []
+    parts.append("")
     parts.append(f"You were woken because: {TRIGGER_LINE.get(trigger, trigger)}")
     return "\n".join(parts)
 
@@ -477,8 +516,10 @@ async def run_episode(*, pool_id: str, trigger: str, pp, llm, meter: TokenMeter,
         messages.append({"role": "tool", "tool_call_id": pending.get("tool_call_id"),
                          "content": json.dumps(wake_digest(trigger, snap, changes))})
     else:
+        settlement = await store.get_settlement(pool_id)
         messages = [{"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": build_brief(pool, people, invoices, snap, trigger)}]
+                    {"role": "user",
+                     "content": build_brief(pool, people, invoices, snap, trigger, settlement)}]
     if human_message:
         messages.append({"role": "user", "content": _human_block(human_message)})
 

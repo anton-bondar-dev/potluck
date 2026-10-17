@@ -144,8 +144,15 @@ SCHEMAS = {
         {"reason": {"type": "string"}}, ["reason"]),
 
     "close_pool": _schema(
-        "close_pool", "Close the pool with a short summary for the humans involved.",
-        {"summary": {"type": "string"}}, ["summary"]),
+        "close_pool",
+        "Close the pool with a short summary for the humans involved. The decision is "
+        "already made and the money has already moved — describe what happened, in the "
+        "terms of the decision you took. Only call this once PayPal reports the payout "
+        "terminal.",
+        {"summary": {"type": "string",
+                     "description": "Two or three sentences: what was decided, what "
+                                    "moved, and what each person should expect to see."}},
+        ["summary"]),
 }
 
 

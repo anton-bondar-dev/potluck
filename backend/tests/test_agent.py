@@ -346,6 +346,16 @@ async def lifecycle(pp, b):
           (await run_episode(pool_id=pid, trigger="tick", pp=pp, llm=ScriptedLLM([]),
                              meter=meter, bus=b)).reason == "terminal_phase")
 
+    closing_brief = llm4.histories[0][1]["content"]
+    check("THE CLOSING EPISODE IS TOLD WHAT WAS DECIDED",
+          "ALREADY DECIDED" in closing_brief and "RELEASE" in closing_brief, closing_brief[-400:])
+    check("including the words it quoted, so the summary cannot contradict the branch",
+          "Only buy it if we reach $180." in closing_brief)
+    check("and what PayPal says about each item",
+          "PayPal reports per item" in closing_brief)
+    check("a pool with no settlement gets no such block",
+          "ALREADY DECIDED" not in llm.histories[0][1]["content"])
+
     types = {e["type"] for e in await events(pid)}
     for needed in ("episode_start", "model_turn", "thought", "step_start", "step_result",
                    "agent_sleep", "agent_wake", "episode_end", "budget", "decision",
