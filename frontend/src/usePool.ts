@@ -185,9 +185,12 @@ function apply(s: PoolState, ev: Ev): PoolState {
       break
 
     case 'reminder_sent':
-      if (pool) {
+      // SET, never increment. The repaint already carries the current count and then
+      // every historical reminder_sent is replayed on top of it — an increment here
+      // showed six nudges against a cap of three. The event carries the true number.
+      if (pool && ev.reminders !== undefined) {
         pool.rows = pool.rows.map((r) =>
-          r.cid === str('cid') ? { ...r, reminders: r.reminders + 1 } : r,
+          r.cid === str('cid') ? { ...r, reminders: num('reminders') } : r,
         )
       }
       push({ kind: 'note', title: `Nudged ${str('name')}`, body: str('note') })
@@ -334,15 +337,29 @@ export function usePool(poolId: string | null): PoolState & { reload: () => void
 
     ;(async () => {
       let from = 0
+      let closedAlready = false
       try {
         const pool = await getPool(poolId)
         if (dead) return
-        let s: PoolState = { ...EMPTY, pool, lastSeq: 0 }
+        let s: PoolState = { ...EMPTY, pool, flashed: new Set(), lastSeq: 0 }
         for (const ev of pool.events || []) s = apply(s, ev)
-        from = s.lastSeq
-        setState({ ...s, pool: { ...pool, ...s.pool } as Pool })
+        // The cursor is the projection's own last_seq: the event list it ships is
+        // capped, so the newest frame it contains is not necessarily the newest frame
+        // there is, and resuming from the wrong one would re-deliver or skip.
+        from = Math.max(s.lastSeq, pool.last_seq || 0)
+        closedAlready = (s.pool?.phase || pool.phase) === 'CLOSED'
+        setState({ ...s, pool: { ...pool, ...s.pool } as Pool, lastSeq: from })
       } catch (e) {
         if (!dead) setState((p) => ({ ...p, error: (e as Error).message }))
+        return
+      }
+
+      // A closed pool has nothing left to say, and the cursor is already past its final
+      // frame — opening a stream on one would sit on a heartbeat for ever. Decided from
+      // the value in hand rather than from a setState updater, which React may batch or
+      // (in StrictMode) call twice.
+      if (closedAlready) {
+        setState((p) => ({ ...p, ended: true }))
         return
       }
 
@@ -357,12 +374,21 @@ export function usePool(poolId: string | null): PoolState & { reload: () => void
           return
         }
         setState((p) => apply(p, ev))
+        if (ev.type === 'end') {
+          // The server returns after the terminal sentinel, and EventSource treats a
+          // closed connection as something to RETRY — so a finished pool would reconnect
+          // for ever, which is most of the pools a judge will open. Nothing more is
+          // coming; hang up.
+          es.close()
+          setState((p) => ({ ...p, connected: false, ended: true }))
+        }
       }
       es.onerror = () => {
         // EventSource reconnects by itself and sends Last-Event-ID, so this is a
         // status change, not a failure. Only a closed socket is terminal.
         setState((p) => ({ ...p, connected: false }))
         if (es.readyState === EventSource.CLOSED) {
+          // One repaint, so a stream that cannot come back still leaves a correct screen.
           getPool(poolId)
             .then((pool) => !dead && setState((p) => ({ ...p, pool })))
             .catch(() => undefined)

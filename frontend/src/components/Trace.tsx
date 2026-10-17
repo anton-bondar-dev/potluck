@@ -98,7 +98,6 @@ function Card({ item }: { item: TraceItem }) {
 }
 
 export default function Trace({ items }: { items: TraceItem[] }) {
-  const end = useRef<HTMLDivElement>(null)
   const box = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
 
@@ -113,7 +112,13 @@ export default function Trace({ items }: { items: TraceItem[] }) {
   }, [])
 
   useEffect(() => {
-    if (pinned.current) end.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    // scrollTo on the container, never scrollIntoView on a child: scrollIntoView walks
+    // UP through every scrollable ancestor including the document, so each new trace
+    // card would drag the whole page down and scroll the decision card out of view by
+    // itself. Only this column should move.
+    if (pinned.current && box.current) {
+      box.current.scrollTo({ top: box.current.scrollHeight, behavior: 'smooth' })
+    }
   }, [items.length])
 
   return (
@@ -136,7 +141,6 @@ export default function Trace({ items }: { items: TraceItem[] }) {
             ))}
           </ol>
         )}
-        <div ref={end} />
       </div>
     </div>
   )

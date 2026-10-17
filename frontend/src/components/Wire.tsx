@@ -16,9 +16,10 @@ const ORIGIN: Record<string, string> = {
 }
 
 export default function Wire({ calls }: { calls: WireCall[] }) {
-  const end = useRef<HTMLDivElement>(null)
+  const box = useRef<HTMLDivElement>(null)
   useEffect(() => {
-    end.current?.scrollIntoView({ block: 'end' })
+    // Same reason as the trace column: scrollIntoView would scroll the document too.
+    if (box.current) box.current.scrollTop = box.current.scrollHeight
   }, [calls.length])
 
   const posts = calls.filter((c) => c.method === 'POST').length
@@ -32,7 +33,10 @@ export default function Wire({ calls }: { calls: WireCall[] }) {
           {calls.length} calls · {posts} POST · sandbox
         </span>
       </div>
-      <div className="h-[132px] overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-[1.55]">
+      <div
+        ref={box}
+        className="h-[132px] overflow-y-auto px-3 py-1.5 font-mono text-[11px] leading-[1.55]"
+      >
         {calls.length === 0 ? (
           <p className="py-4 text-center text-text-faint">No calls yet.</p>
         ) : (
@@ -52,7 +56,6 @@ export default function Wire({ calls }: { calls: WireCall[] }) {
             </div>
           ))
         )}
-        <div ref={end} />
       </div>
     </div>
   )

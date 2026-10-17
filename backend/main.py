@@ -274,6 +274,17 @@ async def stream_pool(pool_id: str, request: Request, from_seq: int = 0):
         except ValueError:
             pass
 
+    pool = await store.get_pool(pool_id)
+    if pool and pool["phase"] == "CLOSED" and from_seq:
+        # Opened on a pool that is already over, with a cursor past its final frame.
+        # Nothing more will ever be published here, so say so and close rather than
+        # holding a socket open sending heartbeats into the void — EventSource would
+        # also treat the eventual close as a reason to reconnect, for ever.
+        async def done():
+            yield f"data: {json.dumps({'type': 'end', 'phase': 'CLOSED'})}\n\n"
+        return StreamingResponse(done(), media_type="text/event-stream", headers={
+            "X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
     async def gen():
         # The subscription is closed explicitly. A dropped connection closes THIS
         # generator, which throws GeneratorExit at the yield below — and that does not

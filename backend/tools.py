@@ -420,8 +420,13 @@ async def _remind_contributors(ctx, args, pool):
             continue
         await store.bump_reminder(ctx.pool_id, cid)
         reminded.append(cid)
-        await ctx.emit("reminder_sent", {"cid": cid, "name": people.get(cid, {}).get("name"),
-                                         "note": note})
+        # The count travels with the event so a client can SET it. Incrementing on the
+        # client double-counts the moment a replay re-delivers the frame, which is every
+        # time anyone refreshes.
+        await ctx.emit("reminder_sent", {
+            "cid": cid, "name": people.get(cid, {}).get("name"), "note": note,
+            "reminders": int(invs[cid]["reminders"]) + 1,
+            "max_reminders": settings.max_reminders})
     return {"reminded": reminded, "blocked": blocked}
 
 
