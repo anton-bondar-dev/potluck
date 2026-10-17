@@ -271,6 +271,12 @@ function apply(s: PoolState, ev: Ev): PoolState {
       push({ kind: 'note', title: 'Pool closed', body: str('summary') })
       break
 
+    case 'human_message':
+      // A judge's own words belong in the trace, right before whatever the agent does
+      // about them — that juxtaposition IS the demonstration.
+      push({ kind: 'note', title: 'A human said', body: str('text') })
+      break
+
     case 'receipt':
       next.receipt = { ...ev }
       break
