@@ -162,6 +162,10 @@ export default function Ledger({
   const contributors = pool.rows.filter((r) => !r.flags.includes('RECIPIENT'))
   const recipient = pool.rows.find((r) => r.flags.includes('RECIPIENT'))
   const ordered = recipient ? [...contributors, recipient] : contributors
+  const needsAPush =
+    pool.phase === 'COLLECTING' &&
+    pool.paid_count === 0 &&
+    contributors.some((r) => Boolean(r.invoice_id))
 
   return (
     <div className="overflow-hidden rounded-card border border-border bg-surface-1">
@@ -173,6 +177,21 @@ export default function Ledger({
           v{pool.ledger_version} · {pool.paid_count}/{pool.n} paid
         </span>
       </div>
+      {needsAPush && (
+        <p className="border-b border-accent/20 bg-accent-dim px-3 py-2 text-[12px] leading-relaxed text-accent-hi">
+          <span className="font-medium text-text-hi">Your turn — you are the contributors.</span>{' '}
+          Press{' '}
+          <span className="rounded border border-border-strong bg-surface-3 px-1 py-px font-mono text-[11px] text-text-hi">
+            pay
+          </span>{' '}
+          on any row to send a real PayPal sandbox payment and watch the agent react, or{' '}
+          <span className="rounded border border-border bg-surface-2 px-1 py-px font-mono text-[11px] text-text-dim">
+            part
+          </span>{' '}
+          to pay half and hand it a problem. Whether the pool reaches its target is up to
+          you; what the agent does about it is up to the agent.
+        </p>
+      )}
       {/* The table has six columns and a floor of about 620px. On a 390px phone an
           overflow-hidden wrapper simply cut it off; scrolling it sideways keeps every
           column readable at full size instead of shrinking all of them past legibility. */}
@@ -185,7 +204,7 @@ export default function Ledger({
             <th className="px-3 py-2 font-semibold">Invoice</th>
             <th className="px-3 py-2 font-semibold">Paid</th>
             <th className="px-3 py-2 text-center font-semibold">Nudges</th>
-            <th className="px-3 py-2 text-right font-semibold">Sandbox</th>
+            <th className="px-3 py-2 text-right font-semibold">Pay as them</th>
           </tr>
         </thead>
         <tbody>

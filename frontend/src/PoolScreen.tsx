@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { messageAgent, payAs } from './api'
 import Decision from './components/Decision'
 import Escalated from './components/Escalated'
@@ -35,12 +35,39 @@ const ATTACKS = [
   },
 ]
 
+/** A dropped stream used to be a 6px dot.
+ *
+ *  EventSource reconnects on its own, so a blink is not worth shouting about — but a
+ *  stream that stays down leaves a page that has simply stopped moving, and the only
+ *  honest reading of that from the outside is "the demo is broken". So: silence for six
+ *  seconds, then say it in words and offer the repaint that fixes it. The pool itself is
+ *  on the server and was never in danger; only this screen fell behind.
+ */
+function useStalled(connected: boolean, live: boolean): boolean {
+  const [stalled, setStalled] = useState(false)
+  useEffect(() => {
+    if (connected || !live) {
+      setStalled(false)
+      return
+    }
+    const t = setTimeout(() => setStalled(true), 6000)
+    return () => clearTimeout(t)
+  }, [connected, live])
+  return stalled
+}
+
 /** Four lanes, laid out so the eye knows where to go when the agent acts:
  *  the trace on the left, the ledger in the middle, the gauges on the right, the
  *  PayPal wire beneath — and a full-width takeover when the branch lands.
  */
 export default function PoolScreen({ poolId, onNew }: { poolId: string; onNew: () => void }) {
   const st = usePool(poolId)
+  // Before the early returns: a hook cannot be called conditionally, so the liveness
+  // test is written against `st` rather than the `pool`/`closed` locals further down.
+  const stalled = useStalled(
+    st.connected,
+    Boolean(st.pool) && st.pool?.phase !== 'CLOSED' && !st.ended,
+  )
   const [busy, setBusy] = useState<string | null>(null)
   const [note, setNote] = useState('')
   const [toast, setToast] = useState<string | null>(null)
@@ -93,12 +120,18 @@ export default function PoolScreen({ poolId, onNew }: { poolId: string; onNew: (
           <div className="flex items-center gap-2.5">
             <h1 className="text-[17px] font-semibold tracking-tight text-text-hi">Potluck</h1>
             <span
+              aria-hidden
               className={`h-1.5 w-1.5 rounded-full ${
                 st.connected ? 'bg-paid' : closed ? 'bg-text-faint' : 'bg-guard pulse-ring'
               }`}
-              title={st.connected ? 'live' : closed ? 'finished' : 'reconnecting'}
             />
-            <span className="nums font-mono text-[11px] text-text-faint">
+            <span
+              role="status"
+              className={`nums font-mono text-[11px] ${
+                !st.connected && !closed ? 'text-guard' : 'text-text-faint'
+              }`}
+            >
+              {st.connected ? 'live' : closed ? 'finished' : 'reconnecting…'} ·{' '}
               {pool.mock ? 'MOCK' : 'PayPal sandbox'} · seq {st.lastSeq}
             </span>
           </div>
@@ -125,6 +158,24 @@ export default function PoolScreen({ poolId, onNew }: { poolId: string; onNew: (
           </button>
         </div>
       </header>
+
+      {stalled && (
+        <div
+          role="alert"
+          className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-ctl border border-guard/30 bg-guard-dim px-3 py-2 text-[12px] text-guard"
+        >
+          <span>
+            The live stream dropped. The pool is still running on the server and nothing is
+            lost — this page has just stopped updating.
+          </span>
+          <button
+            onClick={st.reload}
+            className="rounded-ctl border border-guard/40 px-2 py-0.5 text-[11px] font-medium transition hover:bg-guard/10"
+          >
+            reload it
+          </button>
+        </div>
+      )}
 
       {toast && (
         <p className="mt-3 rounded-ctl border border-guard/30 bg-guard-dim px-3 py-2 text-[12px] text-guard">
