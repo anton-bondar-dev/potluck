@@ -270,6 +270,9 @@ async def human_refund(pp, b):
         check("no address is published in the clear",
               all("***" in i["email_masked"] for i in sub["items"]), sub["items"])
         check("the pool is now settling", (await store.get_pool(pid))["phase"] == "SETTLING")
+        moves = [(e["from"], e["to"]) for e in await events(pid, "phase")]
+        check("every phase move the escalated pool makes is announced",
+              ("ESCALATED", "SETTLING") in moves, moves)
 
         r = await c.post(f"/api/pools/{pid}/approve-refund", json={})
         check("approving twice is refused", r.status_code == 409, r.status_code)

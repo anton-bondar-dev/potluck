@@ -518,10 +518,16 @@ async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_qu
 
     # 3. Only now take the settle lock. A concurrent caller loses here, cleanly.
     phase = pool["phase"]
-    if phase == "COLLECTING" and not await store.advance(ctx.pool_id, "COLLECTING", "RESOLVING"):
-        existing = await store.get_settlement(ctx.pool_id)
-        raise GuardError("ALREADY_SETTLED", "this pool is already being settled",
-                         batch_id=(existing or {}).get("batch_id"))
+    if phase == "COLLECTING":
+        if not await store.advance(ctx.pool_id, "COLLECTING", "RESOLVING"):
+            existing = await store.get_settlement(ctx.pool_id)
+            raise GuardError("ALREADY_SETTLED", "this pool is already being settled",
+                             batch_id=(existing or {}).get("batch_id"))
+        # Announce it. Only the later move to SETTLING used to be published, so a viewer
+        # watching live saw the stepper sitting on "Collecting" while the decision card
+        # said UNWIND — the one moment the phase display most needs to be right.
+        await ctx.emit("phase", {"from": "COLLECTING", "to": "RESOLVING",
+                                 "reason": "deciding"})
     lock_phase = "RESOLVING" if phase in ("COLLECTING", "RESOLVING") else phase
 
     # 4. Write-ahead the settlement BEFORE any HTTP money call, so a crash mid-flight

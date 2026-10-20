@@ -128,6 +128,10 @@ async def main():
     for needed in ("ledger_init", "ledger_row", "pool_totals", "reminder_sent", "guard_block",
                    "decision", "fact_check", "payout_submitted", "payout_item", "pool_closed"):
         check(f"event '{needed}' was streamed", needed in types, types[:40])
+    moves = [(e["from"], e["to"]) for e in evs if e["type"] == "phase"]
+    check("the stepper can follow every move: DRAFT->COLLECTING->RESOLVING->SETTLING",
+          moves[:3] == [("DRAFT", "COLLECTING"), ("COLLECTING", "RESOLVING"),
+                        ("RESOLVING", "SETTLING")], moves)
     dec = next(e for e in evs if e["type"] == "decision")
     check("the decision event carries the model's own words and a policy quote",
           dec["policy_quote"].startswith("If we fall short") and dec["attested"] is True, dec)
