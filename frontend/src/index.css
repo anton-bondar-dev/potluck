@@ -34,8 +34,11 @@
 
   --color-text-hi: #f4f4f6;
   --color-text: #c6c8ce;
-  --color-text-dim: #898d96;
-  --color-text-faint: #6b6f79;
+  --color-text-dim: #9aa0aa;
+  /* Was #6b6f79, which fails WCAG AA on every surface here at 10-11px — and it is the
+     colour carrying the authority table and the "nothing parses your condition" line,
+     i.e. the project's central claim. 4.6:1 against the page background. */
+  --color-text-faint: #868d98;
 
   --color-accent: #7c6cf0;
   --color-accent-hi: #a394ff;

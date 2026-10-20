@@ -321,6 +321,26 @@ def main() -> int:
                 print(f"  ! line {i + 1} runs {over:.1f}s into line {i + 2} — shorten the "
                       f"script or move the cue: \"{cues[i][2][:52]}\"")
 
+    # NO TWO CAPTIONS ON SCREEN AT ONCE. plan_pool, send_invoices and the first sleep
+    # all land inside four seconds, so holds written by hand stack three deep and none of
+    # them can be read. This runs AFTER the voice block on purpose, so a clip that
+    # overruns its slot is trimmed too — and says so, because the real fix for that is a
+    # shorter line, not a clipped caption.
+    MIN_READ = 1.3
+    trimmed: list[tuple[float, float, str]] = []
+    for i, (a, b, text) in enumerate(cues):
+        nxt = cues[i + 1][0] if i + 1 < len(cues) else None
+        end = min(b, nxt - 0.18) if nxt is not None else b
+        if b - end > 0.25:
+            print(f"  ! caption {i + 1} truncated by {b - end:.1f}s to make room for the "
+                  f"next one: \"{text.replace(chr(92) + 'N', ' ')[:46]}\"")
+        if end - a < MIN_READ:
+            print(f"  ! caption {i + 1} dropped, no room to read it: "
+                  f"\"{text.replace(chr(92) + 'N', ' ')[:46]}\"")
+            continue
+        trimmed.append((a, end, text))
+    cues = trimmed
+
     ass_path = work / "caps.ass"
     ass_path.write_text(build_ass(cues, w, h))
     print(f"captions: {len(cues)} cues -> {ass_path}")
@@ -334,6 +354,10 @@ def main() -> int:
          "-frames:v", "1", scrim])
 
     out = Path(args.out)
+    # The video is the master. -shortest would let the audio decide, and the audio ends
+    # with the last spoken line — which silently cut six seconds off the end, taking most
+    # of the end card with it.
+    vid_len = float(probe(final_src, "duration") or 0)
     vf = (f"[0:v][1:v]overlay=0:{h - args.scrim}[bg];"
           f"[bg]ass={ass_path}:fontsdir=/System/Library/Fonts[v]")
     cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", final_src, "-i", scrim]
@@ -353,23 +377,29 @@ def main() -> int:
         tags = "".join(f"[v{i}]" for i in range(n_in - len(voice_plan), n_in))
         audio_filter = (";".join(voice_parts)
                         + f";{tags}amix=inputs={len(voice_plan)}:normalize=0,"
-                          "loudnorm=I=-17:TP=-1.5:LRA=11[vox]")
+                          "loudnorm=I=-17:TP=-1.5:LRA=11[voxmix]")
         if args.music:
             # Duck the bed under the voice rather than setting it quiet throughout: the
             # music can breathe between lines and still never fight the narration.
-            audio_filter += (f";[{music_idx}:a][vox]sidechaincompress="
+            # asplit because the voice is needed TWICE — once to key the compressor and
+            # once in the mix — and an ffmpeg filter output may only be consumed once.
+            audio_filter += (";[voxmix]asplit=2[voxkey][voxout]"
+                             f";[{music_idx}:a][voxkey]sidechaincompress="
                              "threshold=0.03:ratio=9:attack=12:release=420[duck]"
-                             ";[duck][vox]amix=inputs=2:normalize=0:duration=first[aout]")
+                             ";[duck][voxout]amix=inputs=2:normalize=0:duration=longest,"
+                             "apad[aout]")
             amap = "[aout]"
         else:
-            amap = "[vox]"
+            audio_filter += ";[voxmix]apad[aout]"
+            amap = "[aout]"
     elif args.music:
         amap = f"{music_idx}:a"
 
     cmd += ["-filter_complex", vf + (";" + audio_filter if audio_filter else ""), "-map", "[v]"]
     if amap:
-        cmd += ["-map", amap, "-c:a", "aac", "-b:a", "176k", "-shortest"]
-    cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p",
+        cmd += ["-map", amap, "-c:a", "aac", "-b:a", "176k"]
+    cmd += ["-t", f"{vid_len:.3f}",
+            "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart", out]
     run(cmd)
 

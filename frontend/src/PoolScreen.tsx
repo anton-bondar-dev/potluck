@@ -155,12 +155,17 @@ export default function PoolScreen({ poolId, onNew }: { poolId: string; onNew: (
         </div>
       )}
 
+      {/* Source order is the desktop reading order — trace, ledger, gauges. A phone
+          stacks it, which buried the hero number and the countdown below a trace log
+          taller than the screen. On narrow viewports the order is inverted to what
+          someone actually needs first: how much is in, how long is left, who has paid,
+          and only then the reasoning. */}
       <div className="mt-4 grid gap-4 lg:grid-cols-[360px_minmax(0,1fr)_300px]">
-        <div className="flex min-h-[520px] flex-col lg:h-[calc(100vh-230px)] lg:min-h-0">
+        <div className="order-3 flex max-h-[60vh] min-h-[340px] flex-col lg:order-1 lg:h-[calc(100vh-230px)] lg:max-h-none lg:min-h-0">
           <Trace items={st.trace} />
         </div>
 
-        <div className="space-y-4">
+        <div className="order-2 space-y-4 lg:order-2">
           <Ledger pool={pool} onPay={pay} busy={busy} />
           <Wire calls={st.wire} />
           <div className="rounded-card border border-border bg-surface-1 p-3">
@@ -215,7 +220,7 @@ export default function PoolScreen({ poolId, onNew }: { poolId: string; onNew: (
           </div>
         </div>
 
-        <div className="space-y-3">
+        <div className="order-1 space-y-3 lg:order-3">
           <Gauges pool={pool} />
           <Authority />
         </div>

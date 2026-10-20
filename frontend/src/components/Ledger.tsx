@@ -173,7 +173,11 @@ export default function Ledger({
           v{pool.ledger_version} · {pool.paid_count}/{pool.n} paid
         </span>
       </div>
-      <table className="w-full border-collapse text-left">
+      {/* The table has six columns and a floor of about 620px. On a 390px phone an
+          overflow-hidden wrapper simply cut it off; scrolling it sideways keeps every
+          column readable at full size instead of shrinking all of them past legibility. */}
+      <div className="overflow-x-auto">
+      <table className="w-full min-w-[620px] border-collapse text-left">
         <thead>
           <tr className="text-[10px] font-semibold tracking-[0.1em] text-text-faint uppercase">
             <th className="px-3 py-2 font-semibold">Who</th>
@@ -190,6 +194,7 @@ export default function Ledger({
           ))}
         </tbody>
       </table>
+      </div>
       <div className="border-t border-border px-3 py-2 text-[11px] text-text-faint">
         Amounts come from the roster the agent set at plan time. It cannot re-price an
         invoice, mark anyone as paid, or edit this table.
