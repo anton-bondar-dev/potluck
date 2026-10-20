@@ -199,7 +199,8 @@ class ToolContext:
 
 # --- ledger helpers ---------------------------------------------------------
 async def refresh_from_paypal(ctx: ToolContext, *, origin: str = "agent",
-                             include_terminal: bool = False) -> dict:
+                             include_terminal: bool = False,
+                             strict: bool = False) -> dict:
     """Re-derive the ledger from PayPal's own numbers. The single definition of 'paid'.
 
     Public because the ticker owns the routine sweep: it polls, writes the ledger and
@@ -223,13 +224,24 @@ async def refresh_from_paypal(ctx: ToolContext, *, origin: str = "agent",
         async with ctx._sem:
             try:
                 return inv["cid"], await ctx.pp.get_invoice(inv["invoice_id"], origin=origin)
-            except Exception:  # noqa: BLE001 — one bad invoice must not fail the sweep
+            except Exception as exc:  # noqa: BLE001
+                # A routine sweep shrugs: one unreadable invoice must not stop the
+                # others. The SETTLE path cannot shrug — a contribution it failed to
+                # read would silently not exist, and the refund for that person would
+                # simply not be made. Strict callers get the failure.
+                if strict:
+                    return inv["cid"], exc
                 return None
 
     for res in await asyncio.gather(*[one(i) for i in invoices]):
         if not res:
             continue
         cid, body = res
+        if isinstance(body, Exception):
+            raise GuardError("PAYPAL_UNREADABLE",
+                             f"could not read {cid}'s invoice from PayPal "
+                             f"({type(body).__name__}), so the ledger cannot be trusted "
+                             "right now — nothing has been changed. Try again.")
         status = body.get("status") or "SENT"
         paid = paid_cents_from_invoice(body)
         source = "merchant_recorded" if status == "MARKED_AS_PAID" else (
@@ -490,7 +502,7 @@ async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_qu
         raise GuardError("BAD_ARGS", "decision must be RELEASE or UNWIND")
 
     # 1. Freeze the truth from PayPal itself, never from the ledger cache.
-    truth = await refresh_from_paypal(ctx, origin="settle", include_terminal=True)
+    truth = await refresh_from_paypal(ctx, origin="settle", include_terminal=True, strict=True)
 
     # 2. Validate everything. Any failure below leaves the pool exactly as it was.
     if attest is not None:
@@ -587,18 +599,24 @@ async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_qu
                         "call close_pool to finish",
                 "invariants_checked": ["conservation", "settle_once"]}
 
-    batch = await ctx.pp.create_payout(
-        sbid, [{"email": i["email"], "amount_cents": i["amount_cents"],
-                "note": f"Potluck {decision.lower()}", "sender_item_id": i["cid"]} for i in items],
-        subject="Potluck", origin="settle")
+    try:
+        batch = await submit_payout(ctx, sbid, items, decision, origin="settle")
+    except Exception as exc:  # noqa: BLE001
+        # The settlement row is already written, so the decision stands and the item list
+        # is fixed. What failed is one HTTP call. Leaving it here used to freeze the pool
+        # in SETTLING for ever with the money immobilised and even the human refund
+        # button refusing. The ticker re-drives it with the SAME deterministic
+        # sender_batch_id, which PayPal dedupes for thirty days, so a retry cannot pay
+        # twice.
+        await ctx.emit("error", {
+            "where": "create_payout", "recoverable": True,
+            "message": f"PayPal did not accept the payout batch: {str(exc)[:160]}. "
+                       "It will be retried with the same batch id, which cannot pay twice."})
+        return {"batch_id": None, "sender_batch_id": sbid, "kind": decision.lower(),
+                "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
+                "batch_status": "RETRYING", "detail": str(exc)[:160],
+                "invariants_checked": ["conservation", "exact_refunds", "settle_once"]}
     batch_id = batch.get("payout_batch_id", "")
-    await store.set_settlement_batch(ctx.pool_id, batch_id, batch.get("batch_status", "PENDING"))
-    await ctx.emit("payout_submitted", {
-        "batch_id": batch_id, "sender_batch_id": sbid, "kind": decision.lower(),
-        "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
-        "items": [{"cid": i["cid"], "name": i["name"], "email_masked": mask_email(i["email"]),
-                   "amount_cents": i["amount_cents"]} for i in items],
-        "batch_status": batch.get("batch_status", "PENDING"), "by": decided_by})
     return {"batch_id": batch_id, "sender_batch_id": sbid, "kind": decision.lower(),
             "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
             "batch_status": batch.get("batch_status", "PENDING"),
@@ -615,6 +633,25 @@ async def _resolve_pool(ctx, args, pool):
         attest=args.get("attest") or {})
 
 
+
+
+async def submit_payout(ctx: ToolContext, sbid: str, items: list[dict], decision: str,
+                        *, origin: str = "settle") -> dict:
+    """POST the batch and record it. Shared with the ticker's re-drive, so a first attempt
+    and a retry are byte-for-byte the same request under the same deterministic id."""
+    batch = await ctx.pp.create_payout(
+        sbid, [{"email": i["email"], "amount_cents": i["amount_cents"],
+                "note": f"Potluck {decision.lower()}", "sender_item_id": i["cid"]} for i in items],
+        subject="Potluck", origin=origin)
+    batch_id = batch.get("payout_batch_id", "")
+    await store.set_settlement_batch(ctx.pool_id, batch_id, batch.get("batch_status", "PENDING"))
+    await ctx.emit("payout_submitted", {
+        "batch_id": batch_id, "sender_batch_id": sbid, "kind": decision.lower(),
+        "item_count": len(items), "total_cents": sum(i["amount_cents"] for i in items),
+        "items": [{"cid": i["cid"], "name": i["name"], "email_masked": mask_email(i["email"]),
+                   "amount_cents": i["amount_cents"]} for i in items],
+        "batch_status": batch.get("batch_status", "PENDING"), "by": origin})
+    return batch
 
 
 async def poll_payout(ctx, args, pool, *, origin: str = "settle",

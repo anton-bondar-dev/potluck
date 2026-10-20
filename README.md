@@ -178,7 +178,7 @@ cd backend
 for t in test_store test_bus test_guards test_tools test_agent test_ticker test_api test_settle; do
   printf '%-12s ' $t; USE_MOCK_PAYPAL=1 ./.venv/bin/python tests/$t.py | tail -1
 done
-# 396 passing, 0 failing
+# 433 passing, 0 failing
 ```
 
 `tests/test_guards.py` is an adversarial table: ~25 hostile payloads each asserted blocked.
@@ -186,6 +186,12 @@ The races live where the locks do — twelve concurrent phase advances and twelv
 claims on one pool (`tests/test_store.py:48`), and two tickers racing one pool
 (`tests/test_ticker.py`), each asserting exactly one winner. The suites are written to be
 read: every assertion names what would break if it failed.
+
+They also cover the path that matters most and is easiest to skip: what happens when
+PayPal says no. A 503 on the settle path refuses the settlement and leaves the pool
+untouched rather than refunding from numbers it could not read; a 500 on the payout POST
+leaves a decision that the ticker finishes under the same deterministic batch id, which
+PayPal dedupes — asserted by checking that exactly one batch was ever submitted.
 
 They have earned their keep. Among the real defects they caught: a random `sender_batch_id`
 that would have **paid a retried payout twice**; money as float; a leaked SSE subscriber on

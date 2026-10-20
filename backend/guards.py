@@ -34,7 +34,9 @@ TOOL_PHASES: dict[str, set[str]] = {
     "check_payments": {"COLLECTING", "RESOLVING"},
     "remind_contributors": {"COLLECTING"},
     "drop_contributor": {"COLLECTING"},
-    "sleep_until": {"COLLECTING"},
+    # Also SETTLING: waiting for a payout batch to clear is the one useful thing to do
+    # there, and the PAYOUT_NOT_TERMINAL refusal explicitly tells the model to do it.
+    "sleep_until": {"COLLECTING", "SETTLING"},
     "resolve_pool": {"COLLECTING", "RESOLVING"},
     "check_payout": {"SETTLING"},
     "close_pool": {"SETTLING"},

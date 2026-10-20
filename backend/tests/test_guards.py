@@ -173,6 +173,24 @@ allowed("and the pre-flight accepts that, at zero only",
         lambda: guards.assert_settlement_valid(
             items=[], frozen_collected_cents=0, allowed_emails=ALLOWED, payers=[],
             decision="UNWIND"))
+# The menu and the gate are written in different files and drifted apart once: SETTLING
+# offered sleep_until while check_phase refused it, so a model following the guard's own
+# advice earned a red card instead of a nap. Assert they agree, for every phase.
+import tools as _tools  # noqa: E402
+_mismatch = []
+for _ph, _kw in [("DRAFT", {}), ("COLLECTING", {}), ("COLLECTING", {"deadline_reached": True}),
+                 ("COLLECTING", {"target_met": True}), ("RESOLVING", {}), ("SETTLING", {})]:
+    for _t in _tools.menu_for_phase(_ph, **_kw):
+        _n = _t["function"]["name"]
+        try:
+            guards.check_phase(_n, _ph)
+        except GuardError:
+            _mismatch.append(f"{_ph} offers {_n}")
+check("EVERY TOOL THE MENU OFFERS IS ONE THE PHASE GATE ALLOWS", not _mismatch, _mismatch)
+check("and the gate never allows a tool outside the phases that can reach it",
+      all(ph in {"DRAFT", "COLLECTING", "RESOLVING", "SETTLING"}
+          for phs in guards.TOOL_PHASES.values() for ph in phs))
+
 check("a settlement with no items is trivially finished",
       guards.batch_is_done({"items": [], "batch_status": "NO_PAYOUT"}))
 check("an absent item list is unknown, not empty",

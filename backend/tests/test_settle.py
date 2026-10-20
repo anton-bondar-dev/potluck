@@ -322,6 +322,105 @@ async def agent_keeps_the_last_word(pp, b):
           (await store.get_pool(pid))["phase"] == "SETTLING")
 
 
+async def when_paypal_says_no(pp, b):
+    """The upstream-failure path — where the money bugs actually live.
+
+    Every other suite exercises the happy path and the hostile-input path. Neither tells
+    you what happens when PayPal returns a 500 at the worst moment, and three of the
+    nastiest defects in this project were one refused HTTP call away.
+    """
+    await fresh()
+    print("\n-- when PayPal refuses --")
+
+    # 1. the settle path must not settle on numbers it could not read
+    pid, ctx, invs = await collecting(pp, b)
+    real_get = pp.get_invoice
+    calls = {"n": 0}
+
+    async def flaky_get(invoice_id, origin=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("503 Service Unavailable")
+        return await real_get(invoice_id, origin=origin)
+
+    pp.get_invoice = flaky_get
+    try:
+        out = await tools.dispatch(ctx, "resolve_pool", {
+            "decision": "UNWIND", "reason": "short", "policy_quote": "refund",
+            "attest": {"collected_cents": 13500, "paid_count": 3, "ledger_version": 1}})
+    finally:
+        pp.get_invoice = real_get
+    check("a settlement is REFUSED when an invoice cannot be read",
+          out.get("error") == "PAYPAL_UNREADABLE", out)
+    check("and the pool is left exactly as it was",
+          (await store.get_pool(pid))["phase"] == "COLLECTING")
+    check("with no settlement written", await store.get_settlement(pid) is None)
+    check("no money moved", not await events(pid, "payout_submitted"))
+
+    # ...and it settles normally once PayPal answers again
+    with bus_mod.pool_scope(pid):
+        truth = await tools.refresh_from_paypal(ctx, include_terminal=True, strict=True)
+        out = await tools.dispatch(ctx, "resolve_pool", {
+            "decision": "UNWIND", "reason": "short", "policy_quote": "refund",
+            "attest": {k: truth[k] for k in ("collected_cents", "paid_count", "ledger_version")}})
+    check("the same settlement succeeds once PayPal is readable again",
+          out.get("item_count") == 3, out)
+
+    # 2. a refused payout POST must not freeze the pool
+    await fresh()
+    pid, ctx, invs = await collecting(pp, b)
+    real_payout = pp.create_payout
+
+    async def refuse_payout(*a, **kw):
+        raise RuntimeError("500 INTERNAL_SERVICE_ERROR")
+
+    pp.create_payout = refuse_payout
+    try:
+        with bus_mod.pool_scope(pid):
+            truth = await tools.refresh_from_paypal(ctx, include_terminal=True, strict=True)
+            out = await tools.dispatch(ctx, "resolve_pool", {
+                "decision": "UNWIND", "reason": "short", "policy_quote": "refund",
+                "attest": {k: truth[k] for k in
+                           ("collected_cents", "paid_count", "ledger_version")}})
+    finally:
+        pp.create_payout = real_payout
+    check("a refused payout is reported, not raised",
+          out.get("batch_status") == "RETRYING", out)
+    s = await store.get_settlement(pid)
+    check("the decision still stands, with its item list fixed",
+          s and s["decision"] == "UNWIND" and len(s["items"]) == 3)
+    check("but no batch id was invented", not s.get("batch_id"))
+    check("and the error is published as recoverable",
+          any(e["where"] == "create_payout" and e["recoverable"]
+              for e in await events(pid, "error")))
+
+    t = Ticker(pp=pp, llm=CountingLLM(), meter=agent_core.TokenMeter(budget=500_000),
+               bus=b, interval_s=0.05)
+    t.sweep_every_s = 0.0
+    did = await t._redrive_payout(await store.get_pool(pid))
+    check("THE TICKER FINISHES WHAT THE FAILED CALL STARTED", did)
+    s2 = await store.get_settlement(pid)
+    check("a batch exists now", bool(s2.get("batch_id")), s2.get("batch_id"))
+    check("under the SAME deterministic id, so a retry cannot pay twice",
+          s2["sender_batch_id"] == s["sender_batch_id"] ==
+          guards.sender_batch_id(pid, "UNWIND"))
+    subs = await events(pid, "payout_submitted")
+    check("and exactly one batch was ever submitted", len(subs) == 1, len(subs))
+
+    t.redrive_at.pop(pid, None)
+    check("re-driving an already-sent batch does nothing",
+          not await t._redrive_payout(await store.get_pool(pid)))
+    check("still exactly one batch", len(await events(pid, "payout_submitted")) == 1)
+
+    # 3. a restart mid-payout must not leave the pool settling for ever
+    await asyncio.sleep(3.2)
+    t2 = Ticker(pp=pp, llm=CountingLLM(), meter=agent_core.TokenMeter(budget=500_000),
+                bus=b, interval_s=0.05)
+    await t2.recover()
+    check("a restart schedules the closing turn for a settling pool",
+          t2.wake_at.get(pid) == 0.0, t2.wake_at.get(pid))
+
+
 async def batch_completion():
     print("\n-- when is a batch actually finished --")
     # The bug this exists to prevent: a live batch reported PROCESSING in its header for
@@ -384,6 +483,7 @@ async def main_test():
         await closing_too_early(pp, b)
         await human_refund(pp, b)
         await agent_keeps_the_last_word(pp, b)
+        await when_paypal_says_no(pp, b)
         await batch_completion()
         await migration()
     await store.close_db()

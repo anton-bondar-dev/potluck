@@ -51,6 +51,10 @@ RETRY_AFTER_S = 10.0
 # The countdown turns red here.
 IMMINENT_S = 15
 
+# How often a settlement whose batch PayPal refused may be re-POSTed. The id is
+# deterministic and PayPal dedupes it, so this is about politeness, not safety.
+REDRIVE_EVERY_S = 20.0
+
 
 class Ticker:
     """One asyncio task over every live pool. `tick_once` is the whole thing; the loop
@@ -76,6 +80,7 @@ class Ticker:
         self.nudge_round: dict[str, int] = {}      # total reminders sent, as a round marker
         self.nudge_reported: dict[str, int] = {}   # the round we last woke the agent for
         self.last_sweep: dict[str, float] = {}
+        self.redrive_at: dict[str, float] = {}
         # The clock ticks every pass because the countdown has to be smooth; invoices are
         # swept on their own slower cadence, PER POOL, because a settled invoice cannot
         # change and PayPal is rate-limited. Time-based rather than counting ticks: a
@@ -140,7 +145,11 @@ class Ticker:
             if await self._restore_sleep(pid):
                 resumed += 1
             if pool["phase"] == "SETTLING":
+                await self._redrive_payout(pool)
                 await self._reconcile(pool)
+                # A restart during an in-flight payout used to leave the pool settling
+                # for ever, because nothing ever scheduled the closing turn.
+                self.wake_at[pid] = 0.0
                 if (await store.get_settlement(pid) or {}).get("batch_id"):
                     reconciled += 1
         await store.prune_events()
@@ -164,6 +173,39 @@ class Ticker:
         if tail.get("role") != agent_core.PENDING_SLEEP:
             return False
         self.wake_at[pool_id] = float(ep["ended_at"] or time.time()) + int(tail.get("sleep_s") or 0)
+        return True
+
+    async def _redrive_payout(self, pool: dict) -> bool:
+        """Finish a settlement whose batch was decided but never accepted.
+
+        One failed HTTP call used to freeze a pool in SETTLING for ever: the decision was
+        written, the item list was fixed, and nothing in the system would ever try again
+        — the money sat immobilised and even the human refund button refused, because a
+        settlement already existed. Retrying is safe by construction: the sender_batch_id
+        is derived from the pool and the branch, and PayPal dedupes it for thirty days,
+        so this cannot pay twice however often it runs.
+        """
+        pid = pool["pool_id"]
+        s = await store.get_settlement(pid)
+        if not s or s.get("batch_id") or not (s.get("items") or []):
+            return False
+        if time.time() < self.redrive_at.get(pid, 0):
+            return False
+        self.redrive_at[pid] = time.time() + REDRIVE_EVERY_S
+        ctx = tools.ToolContext(pid, self.pp, self.bus)
+        try:
+            with bus_mod.pool_scope(pid):
+                await tools.submit_payout(ctx, s["sender_batch_id"], s["items"],
+                                          s["decision"], origin="ticker")
+        except Exception as exc:  # noqa: BLE001
+            await self.bus.publish(pid, "error", {
+                "where": "payout_redrive", "recoverable": True,
+                "message": f"the payout batch was refused again: {str(exc)[:140]}"})
+            return False
+        await self.bus.publish(pid, "agent_note", {
+            "text": "The payout batch was refused on the first attempt and has now been "
+                    "accepted, under the same batch id — which is why a retry cannot "
+                    "pay anyone twice."})
         return True
 
     async def _reconcile(self, pool: dict) -> bool:
@@ -240,6 +282,7 @@ class Ticker:
         # 3. An in-flight batch resolves itself, with no model turn spent on watching it,
         #    and anything that arrived after the freeze goes straight back.
         if phase == "SETTLING":
+            await self._redrive_payout(pool)
             just_terminal = await self._reconcile(pool)
             await self._late_sweep(ctx, pool)
             if await self._auto_close(ctx, pool):
