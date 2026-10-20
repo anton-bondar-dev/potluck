@@ -37,12 +37,23 @@ export default function Escalated({
           </span>
         </div>
         <p className="mt-3 text-[13px] leading-relaxed text-text-dim">
-          No money has moved. The unpaid invoices were cancelled and the{' '}
-          <span className="nums font-mono text-text-hi">{money(collected)}</span> that did
-          arrive is sitting exactly where it was. Returning each contributor what they paid
-          needs one human approval — the code will not start a payout by itself.
+          {collected > 0 ? (
+            <>
+              No money has moved. The unpaid invoices were cancelled and the{' '}
+              <span className="nums font-mono text-text-hi">{money(collected)}</span> that
+              did arrive is sitting exactly where it was. Returning each contributor what
+              they paid needs one human approval — the code will not start a payout by
+              itself.
+            </>
+          ) : (
+            <>
+              Nothing was ever collected, so there is nothing to return and nothing to
+              approve. The unpaid invoices were cancelled and the pool is closed.
+            </>
+          )}
         </p>
         {err && <p className="mt-2 text-[12px] text-danger">{err}</p>}
+        {collected > 0 && (
         <button
           onClick={async () => {
             setBusy(true)
@@ -61,6 +72,7 @@ export default function Escalated({
         >
           {busy ? 'Submitting the refund…' : `Refund everyone ${money(collected)}`}
         </button>
+        )}
       </div>
     </section>
   )

@@ -184,8 +184,15 @@ def build_settlement_items(*, decision: str, payers: list[dict], recipient: dict
     """
     if decision not in ("RELEASE", "UNWIND"):
         raise GuardError("BAD_ARGS", f"decision must be RELEASE or UNWIND, got {decision!r}")
-    if frozen_collected_cents <= 0:
-        raise GuardError("NOTHING_COLLECTED", "no money was collected, so there is none to move")
+    if frozen_collected_cents < 0:
+        raise GuardError("BAD_AMOUNT", f"collected cannot be negative: {frozen_collected_cents}")
+    if frozen_collected_cents == 0:
+        # Nothing arrived, so there is nothing to move — and that is an ENDING, not an
+        # error. Refusing here used to leave the agent with no legal way to finish: it
+        # decided correctly, was blocked, ran out of turns and the pool escalated. The
+        # single most likely path through the public demo (create a pool and just watch)
+        # dead-ended in an amber banner, and a judge never saw a decision at all.
+        return []
 
     if decision == "UNWIND":
         # G2: everyone gets back exactly what PayPal says they paid. Not a judgement call.
@@ -217,7 +224,12 @@ def assert_settlement_valid(*, items: list[dict], frozen_collected_cents: int,
                             decision: str, payouts_today_cents: int = 0) -> None:
     """G10 — the single pre-flight both branches pass through. One function to audit."""
     if not items:
-        raise GuardError("NOTHING_COLLECTED", "settlement produced no items")
+        # No items is legitimate only when nothing was collected. Then there is nothing
+        # to check, because there is nothing to move.
+        if frozen_collected_cents == 0:
+            return
+        raise GuardError("NOTHING_COLLECTED",
+                         f"settlement produced no items for {frozen_collected_cents}c")
     if len(items) > settings.max_payout_items:
         raise GuardError("CAP_EXCEEDED",
                          f"{len(items)} payout items exceeds the cap of {settings.max_payout_items}")
@@ -269,6 +281,17 @@ TERMINAL_ITEM_STATUSES = {"SUCCESS", "FAILED", "BLOCKED", "RETURNED", "REFUNDED"
                           "REVERSED", "DENIED", "UNCLAIMED"}
 
 
+def settlement_moves_money(settlement: dict | None) -> bool:
+    """Whether this settlement has anything to pay out.
+
+    An ABSENT item list means unknown, not empty — only an explicitly empty one means
+    nobody is owed anything. Collapsing the two would make a batch look finished merely
+    because a caller did not pass its items.
+    """
+    items = (settlement or {}).get("items")
+    return items is None or bool(items)
+
+
 def batch_is_done(settlement: dict | None) -> bool:
     """Has PayPal finished with this batch?
 
@@ -277,6 +300,8 @@ def batch_is_done(settlement: dict | None) -> bool:
     """
     if not settlement:
         return False
+    if not settlement_moves_money(settlement):
+        return True          # a settlement with no items has nothing to wait for
     items = settlement.get("item_statuses") or {}
     if items:
         return all(v in TERMINAL_ITEM_STATUSES for v in items.values())

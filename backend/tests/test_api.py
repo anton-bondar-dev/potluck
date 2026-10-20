@@ -256,14 +256,41 @@ async def endpoints(c, pp, tick, llm):
           not any(e in blob for e in raw), [e for e in raw if e in blob])
     check("the masked form is what is published", "***" in blob)
 
-    print("\n-- the rate limiter --")
+    print("\n-- the limits that keep one visitor from taking the demo --")
+    settings.per_ip_live_pools = 2
+    try:
+        codes = []
+        for _ in range(4):
+            rr = await c.post("/api/pools", json={"goal_text": GOAL, "policy_text": POLICY})
+            codes.append(rr.status_code)
+        check("ONE VISITOR CANNOT HOLD THE DEMO OPEN — concurrent pools are capped",
+              429 in codes, codes)
+        msg = ""
+        for _ in range(3):
+            rr = await c.post("/api/pools", json={"goal_text": GOAL, "policy_text": POLICY})
+            if rr.status_code == 429:
+                msg = rr.json().get("detail", "")
+                break
+        check("and the refusal explains itself rather than just failing",
+              "pools running" in msg or "Too many" in msg, msg)
+    finally:
+        settings.per_ip_live_pools = 50
+
+    starved = agent_core.TokenMeter(budget=1000)
+    starved.record(1000)
+    main.state["meter"] = starved
+    rr = await c.post("/api/pools", json={"goal_text": GOAL, "policy_text": POLICY})
+    check("a pool is refused rather than started with no tokens to run it",
+          rr.status_code == 503 and "token budget" in rr.json().get("detail", ""), rr.text[:120])
+    main.state["meter"] = agent_core.TokenMeter(budget=500_000)
+
     limited = False
     for _ in range(settings.per_ip_per_min + 4):
         rr = await c.post("/api/pools", json={"goal_text": GOAL, "policy_text": POLICY})
         if rr.status_code == 429:
             limited = True
             break
-    check("one network cannot create pools without limit", limited)
+    check("and the per-minute creation rate is capped too", limited)
 
 
 async def main_test():
@@ -274,6 +301,10 @@ async def main_test():
         tick = Ticker(pp=pp, llm=llm, meter=meter, bus=bus_mod.bus, interval_s=0.05)
         tick.sweep_every_s = 0.0           # drive the sweep directly; cadence is tested elsewhere
         main.state.update(pp=pp, llm=llm, meter=meter, ticker=tick, started_at=time.time())
+        # Most of this file needs several pools open at once from one client. The
+        # concurrent-pool cap is a real guard and gets its own test at the end; lift it
+        # here so it does not shadow everything before it.
+        settings.per_ip_live_pools = 50
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
             await endpoints(c, pp, tick, llm)

@@ -576,6 +576,17 @@ async def execute_settlement(ctx, pool, *, decision: str, reason: str, policy_qu
     await store.advance(ctx.pool_id, lock_phase, "SETTLING")
     await ctx.emit("phase", {"from": lock_phase, "to": "SETTLING", "reason": decision})
 
+    if not items:
+        # Nobody paid. The decision still stands and is still the agent's, there is simply
+        # no money to move — so the pool finishes here rather than waiting for a batch
+        # that will never exist.
+        await store.set_settlement_batch(ctx.pool_id, "", "NO_PAYOUT", {})
+        return {"batch_id": None, "sender_batch_id": sbid, "kind": decision.lower(),
+                "item_count": 0, "total_cents": 0, "batch_status": "NO_PAYOUT",
+                "note": "nothing was collected, so there is nothing to pay out — "
+                        "call close_pool to finish",
+                "invariants_checked": ["conservation", "settle_once"]}
+
     batch = await ctx.pp.create_payout(
         sbid, [{"email": i["email"], "amount_cents": i["amount_cents"],
                 "note": f"Potluck {decision.lower()}", "sender_item_id": i["cid"]} for i in items],

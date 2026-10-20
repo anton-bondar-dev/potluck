@@ -68,7 +68,12 @@ class Settings(BaseSettings):
 
     # --- Service limits -----------------------------------------------------
     per_ip_per_min: int = 10
-    max_live_pools: int = 20
+    # One token window is shared by every live pool, so twenty of them starve each
+    # other: a judge's pool defers while someone else's spends the budget. Four is what
+    # the 28k/minute window actually supports.
+    max_live_pools: int = 4
+    per_ip_live_pools: int = 2        # concurrent, not per minute
+    draft_timeout_s: int = 240        # a pool the agent cannot plan must not be immortal
     run_grace_s: int = 120
 
     # --- Storage & deploy ---------------------------------------------------

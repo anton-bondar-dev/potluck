@@ -163,9 +163,27 @@ blocked("an amount that is a string", "BAD_ARGS",
             items=[{"cid": "rec", "name": "D", "email": "dana@ok.com",
                     "amount_cents": "18000", "kind": "release"}],
             frozen_collected_cents=18000, allowed_emails=ALLOWED, payers=PAYERS, decision="RELEASE"))
-blocked("settling when nothing was collected", "NOTHING_COLLECTED",
+# Nothing collected is an ENDING, not an error. The agent still decides, there is simply
+# nothing to move — and refusing here used to leave it with no legal way to finish, so the
+# most likely path through the public demo dead-ended in an escalation.
+check("a pool nobody paid into settles with no items",
+      guards.build_settlement_items(decision="UNWIND", payers=[], recipient=REC,
+                                    frozen_collected_cents=0, target_cents=18000) == [])
+allowed("and the pre-flight accepts that, at zero only",
+        lambda: guards.assert_settlement_valid(
+            items=[], frozen_collected_cents=0, allowed_emails=ALLOWED, payers=[],
+            decision="UNWIND"))
+check("a settlement with no items is trivially finished",
+      guards.batch_is_done({"items": [], "batch_status": "NO_PAYOUT"}))
+check("an absent item list is unknown, not empty",
+      not guards.batch_is_done({"batch_status": "PENDING"}))
+blocked("but an empty settlement for money that DID arrive is refused", "NOTHING_COLLECTED",
+        lambda: guards.assert_settlement_valid(
+            items=[], frozen_collected_cents=13500, allowed_emails=ALLOWED,
+            payers=PAYERS, decision="UNWIND"))
+blocked("a negative collection is refused outright", "BAD_AMOUNT",
         lambda: guards.build_settlement_items(decision="UNWIND", payers=[], recipient=REC,
-                                              frozen_collected_cents=0, target_cents=18000))
+                                              frozen_collected_cents=-1, target_cents=18000))
 blocked("a decision that is neither branch", "BAD_ARGS",
         lambda: guards.build_settlement_items(decision="STEAL", payers=PAYERS, recipient=REC,
                                               frozen_collected_cents=18000, target_cents=18000))

@@ -253,6 +253,16 @@ class Ticker:
             await self._escalate(ctx, pool, snap,
                                  "the deadline and its grace window passed without a decision")
             return {"pool_id": pid, "action": "escalated"}
+        # A pool stuck in DRAFT has no deadline to pass, so none of the rules above can
+        # ever end it. One that the agent could not plan — a goal with no amounts in it,
+        # or an episode budget spent on refusals — would otherwise hold a slot for the
+        # life of the process and survive restarts.
+        if phase == "DRAFT" and (
+                int(pool["episodes_used"]) >= settings.max_episodes
+                or time.time() - float(pool["created_at"]) > settings.draft_timeout_s):
+            await self._escalate(ctx, pool, snap,
+                                 "the agent could not turn this goal into a plan")
+            return {"pool_id": pid, "action": "unplannable"}
         if pool["demo"] and time.time() - float(pool["created_at"]) > 86400:
             await self._escalate(ctx, pool, snap, "demo pool expired (24h)")
             return {"pool_id": pid, "action": "expired"}
@@ -548,7 +558,16 @@ class Ticker:
             await self.bus.publish(pid, "invoice_cancelled", {
                 "cid": inv["cid"], "invoice_id": inv["invoice_id"]})
 
-        if not await store.advance(pid, phase, "ESCALATED"):
+        try:
+            moved = await store.advance(pid, phase, "ESCALATED")
+        except ValueError:
+            # No legal edge from here. Say so rather than raising on every tick for ever.
+            await self.bus.publish(pid, "error", {
+                "where": "escalate", "recoverable": False,
+                "message": f"a pool in {phase} cannot be escalated"})
+            self.wake_at.pop(pid, None)
+            return
+        if not moved:
             return                                        # someone resolved it underneath us
         await self.bus.publish(pid, "phase", {"from": phase, "to": "ESCALATED",
                                               "reason": reason})

@@ -295,6 +295,47 @@ async def deadline_and_escalation(pp, b):
     check("and spends nothing trying", llm2.n == 0, llm2.n)
 
 
+async def unplannable_pools(pp, b):
+    """A goal the agent cannot plan must not hold a slot for ever.
+
+    This was a live denial-of-service on the public demo: DRAFT had no edge to
+    ESCALATED, so the ticker raised ValueError on every 2-second tick, the row stayed in
+    live_pools and in count_open_pools across restarts, and twenty of them filled the
+    ceiling permanently. It had already happened once by accident.
+    """
+    print("\n-- a pool the agent cannot plan --")
+    await fresh()
+    pid = await store.create_pool(goal_text="x" * 30, policy_text="y" * 30)
+    await store.seed_cast(pid, CAST)
+    check("DRAFT has a way out", ("DRAFT", "ESCALATED") in store.ALLOWED_EDGES)
+
+    llm = CountingLLM(script=[[] for _ in range(30)])     # never produces a plan
+    t = new_ticker(pp, b, llm)
+    await store.db().execute("UPDATE pools SET episodes_used=? WHERE pool_id=?",
+                             (settings.max_episodes, pid))
+    await store.db().commit()
+    did = await t.tick_once()
+    check("a pool out of episodes in DRAFT is ended, not retried for ever",
+          any(d.get("action") == "unplannable" for d in did), did)
+    check("and it reaches a terminal phase",
+          (await store.get_pool(pid))["phase"] == "ESCALATED")
+    check("so it stops holding a slot", await store.count_open_pools() == 0)
+    check("and disappears from the ticker's work list", not await store.live_pools())
+
+    await fresh()
+    pid = await store.create_pool(goal_text="x" * 30, policy_text="y" * 30)
+    await store.seed_cast(pid, CAST)
+    await store.db().execute("UPDATE pools SET created_at=? WHERE pool_id=?",
+                             (time.time() - settings.draft_timeout_s - 5, pid))
+    await store.db().commit()
+    t = new_ticker(pp, b, CountingLLM(script=[[]]))
+    await t.tick_once()
+    check("an old DRAFT pool times out even with episodes left",
+          (await store.get_pool(pid))["phase"] == "ESCALATED")
+    check("ticking an already-ended pool is quiet, not an exception",
+          await t.tick_once() == [])
+
+
 async def human_message(pp, b):
     print("\n-- a human interrupting --")
     await fresh()
@@ -402,6 +443,7 @@ async def main():
         await sweep_cadence(pp, b)
         await interesting_transitions(pp, b)
         await draft_and_sleep(pp, b)
+        await unplannable_pools(pp, b)
         await deadline_and_escalation(pp, b)
         await human_message(pp, b)
         await locks_and_recovery(pp, b)

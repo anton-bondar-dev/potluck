@@ -342,6 +342,11 @@ async def batch_completion():
     check("with no item detail yet, the header is all there is",
           guards.batch_is_done({"batch_status": "SUCCESS", "item_statuses": {}})
           and not guards.batch_is_done({"batch_status": "PENDING", "item_statuses": {}}))
+    check("a settlement that moves nothing is finished the moment it exists",
+          guards.batch_is_done({"batch_status": "NO_PAYOUT", "items": [],
+                                "item_statuses": {}}))
+    check("but an absent item list is unknown, not empty",
+          not guards.batch_is_done({"batch_status": "PENDING", "item_statuses": {}}))
     check("and nothing at all is not done", not guards.batch_is_done(None))
     try:
         guards.check_closable(lagging)

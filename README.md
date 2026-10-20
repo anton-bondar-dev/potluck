@@ -3,8 +3,10 @@
 **Kickstarter's all-or-nothing, for your friend group's everyday money — run end to end by an AI agent on PayPal.**
 
 You state a goal in your own words. An agent invoices every contributor on PayPal, watches
-the money actually arrive, nudges whoever stalls in its own wording, and **at the deadline
-decides**: release the pool to the recipient, or unwind it and refund everyone to the cent.
+the money actually arrive, nudges whoever stalls in its own wording, and **decides**:
+release the pool to the recipient, or unwind it and refund everyone to the cent. It may
+decide as soon as the organizer's condition is settled either way, and no later than the
+deadline.
 Every reasoning step, every guard refusal and every real REST call is streamed live.
 
 **Live demo → https://potluck.overpro.fit** · a demo pool runs its three days in about
@@ -19,10 +21,12 @@ Built for the PayPal AI Hackathon.
 The hard part of an agent that moves money is not making it capable. It is making it
 *safe without making it fake*. The usual answer is to narrow the agent until the
 interesting decision is really an `if` statement with a language model narrating it.
-Potluck goes the other way: **code constrains the money, never the judgement.** No function
-that moves money takes an amount or an email address — both are computed from
-PayPal-verified facts and a roster a human froze — so every action available to the agent
-is harmless, and it can be handed a genuinely open decision without a safety trade.
+Potluck goes the other way: **code constrains the money, never the judgement.** Nothing
+the agent can reach takes an amount or an email address — not a tool schema, not
+`execute_settlement`, not any HTTP endpoint. Both are computed from PayPal-verified facts
+and a roster a human froze, and only the transport function at the very bottom, which the
+model cannot call, ever sees them. So every action available to the agent is harmless, and
+it can be handed a genuinely open decision without a safety trade.
 
 The decision it is handed is deliberately one no schema could hold. The organizer's success
 condition is stored, shown and quoted back as **verbatim unparsed text**. Nothing in this
@@ -38,7 +42,7 @@ Disclosed first, because it is the question a sceptical judge should ask.
 |---|---|
 | **Real** | PayPal sandbox REST, called directly — we wrote the client, no SDK. OAuth2 client-credentials, `POST /v2/invoicing/invoices`, `/send` (returns a real payer-view URL), `GET` for status, `POST /v1/payments/payouts` polled to a terminal per-item status. Every call is streamed with its method, path, status, latency and who asked for it. |
 | **Real** | The agent. Groq `gpt-oss-120b` with OpenAI-style function calling over a rotating 4-key pool. It chooses the split, the recipient, the deadline, the wording of every invoice and nudge, who to chase, when to sleep, and the final branch. Nothing is scripted; two runs of the same pool differ. |
-| **Simulated** | **A recorded payment marks an invoice paid; it does not move funds.** The "pay as Maya (sandbox)" button calls PayPal's merchant *record payment* endpoint, which is how a merchant books an offline payment. The invoice genuinely becomes `MARKED_AS_PAID` at PayPal and the agent cannot tell it apart from a card payment — but nothing left Maya's balance. |
+| **Simulated** | **A recorded payment marks an invoice paid; it does not move funds.** The "pay as Maya (sandbox)" button calls PayPal's merchant *record payment* endpoint, which is how a merchant books an offline payment. The invoice genuinely becomes `MARKED_AS_PAID` at PayPal, the same signal the agent would read from a card payment apart from the status string itself — but nothing left Maya's balance. |
 | **Simulated** | **Payouts draw on the sandbox business account's pre-funded balance,** not on the contributions themselves. Conservation is enforced against the recorded collection, which is what every amount on screen is derived from. |
 | **Real** | The money rail itself. `preflight.py --canary` sends a two-item one-cent payout and polls it to `SUCCESS` — the only proof available, since there is no balance API on our scopes. `/api/healthz` reports `payout_ready` from that run, with its age. |
 | **Honest degradation** | An item sent to an address with no PayPal account returns `UNCLAIMED` and sits for thirty days. The receipt reports per-item statuses, and nothing on screen says "refunds completed" unless PayPal said so. |
@@ -104,9 +108,11 @@ first payment, the target being crossed, someone it personally nudged coming thr
 amount that is not the amount asked for. The ledger fills and the countdown drains in front
 of you at no cost — which is why the cheapest design here is also the most watchable one.
 
-**The tool menu is phase-gated.** The model is handed one to four schemas, never nine.
-`resolve_pool` is not discouraged during collection — it is absent, and refused again by
-`guards.check_phase` if named anyway.
+**The tool menu is phase-gated.** The model is handed one schema in DRAFT, five while
+collecting, two while deciding and three while settling — never the whole set, and never
+the one that matters most until it is allowed to matter. `resolve_pool` is not discouraged
+during collection: it is absent from the menu, and refused again by `guards.check_phase`
+if the model names it anyway.
 
 **Attestation, not supervision.** `resolve_pool` requires the `collected_cents`,
 `paid_count` and `ledger_version` the model is deciding on. Code re-polls PayPal inside the
@@ -142,14 +148,15 @@ is not representable, so prompt injection against the money path is economically
 
 ## Run it
 
-Mock mode needs no credentials and no network at all — the whole lifecycle, payout cascade
-included, runs against an in-memory PayPal with a real state machine. There is a test that
-severs every outbound call and asserts the lifecycle still completes.
+Mock mode removes the need for **PayPal** credentials: the whole lifecycle, payout cascade
+included, runs against an in-memory PayPal with a real state machine, and a test severs
+every outbound PayPal call and asserts it still completes. The agent itself is the product,
+so it still needs a model — a Groq key is free and takes two minutes.
 
 ```bash
 cd backend
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-cp .env.example .env                       # leave it empty for mock mode
+cp .env.example .env     # then put a free Groq key in it: console.groq.com/keys
 USE_MOCK_PAYPAL=1 ./.venv/bin/python -m uvicorn main:app --port 8001
 
 cd ../frontend && npm install && npm run dev      # http://localhost:5173
@@ -174,9 +181,11 @@ done
 # 396 passing, 0 failing
 ```
 
-`tests/test_guards.py` is an adversarial table: ~20 hostile payloads each asserted blocked,
-including two concurrent settlements racing through `asyncio.gather`. The suites are written
-to be read — each assertion names what would break if it failed.
+`tests/test_guards.py` is an adversarial table: ~25 hostile payloads each asserted blocked.
+The races live where the locks do — twelve concurrent phase advances and twelve concurrent
+claims on one pool (`tests/test_store.py:48`), and two tickers racing one pool
+(`tests/test_ticker.py`), each asserting exactly one winner. The suites are written to be
+read: every assertion names what would break if it failed.
 
 They have earned their keep. Among the real defects they caught: a random `sender_batch_id`
 that would have **paid a retried payout twice**; money as float; a leaked SSE subscriber on
@@ -189,7 +198,7 @@ arrived at all.
 
 FastAPI · SQLite (WAL) · httpx · Pydantic v2 · Groq `gpt-oss-120b` · React 19 · Vite ·
 Tailwind 4 · nginx + systemd on a Hetzner box. No agent framework and no PayPal SDK: the
-REST client is 320 lines in `backend/paypal.py`, which is also why every call can be
+REST client is 323 lines in `backend/paypal.py`, which is also why every call can be
 streamed with its origin.
 
 | File | What |

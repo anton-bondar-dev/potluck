@@ -26,6 +26,11 @@ from config import settings
 # always-available safe harbour. Anything not in this table is impossible by construction.
 ALLOWED_EDGES: set[tuple[str, str]] = {
     ("DRAFT", "COLLECTING"),
+    # A pool whose goal the agent cannot plan has to be able to end. Without this edge a
+    # DRAFT pool was immortal: the ticker's escalate path raised ValueError on every
+    # 2-second tick, the row stayed in live_pools and in count_open_pools across
+    # restarts, and twenty of them permanently filled the public demo's ceiling.
+    ("DRAFT", "ESCALATED"),
     ("COLLECTING", "RESOLVING"),
     ("COLLECTING", "ESCALATED"),
     ("RESOLVING", "SETTLING"),
@@ -58,6 +63,7 @@ CREATE TABLE IF NOT EXISTS pools (
   episodes_used  INTEGER NOT NULL DEFAULT 0,
   claimed_until  REAL NOT NULL DEFAULT 0,
   demo         INTEGER NOT NULL DEFAULT 0,
+  created_by   TEXT NOT NULL DEFAULT '',
   created_at   REAL NOT NULL,
   closed_at    REAL
 );
@@ -138,6 +144,7 @@ _write_lock = asyncio.Lock()
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("invoices", "settled_cents", "INTEGER NOT NULL DEFAULT 0"),
     ("settlements", "item_statuses_json", "TEXT"),
+    ("pools", "created_by", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 
@@ -193,15 +200,21 @@ def new_id(prefix: str) -> str:
 
 # --- pools ------------------------------------------------------------------
 async def create_pool(*, goal_text: str, policy_text: str, currency: str = "USD",
-                      clock_scale: int = 1, demo: bool = False) -> str:
-    """A pool starts in DRAFT holding nothing but the human's verbatim words."""
+                      clock_scale: int = 1, demo: bool = False,
+                      created_by: str = "") -> str:
+    """A pool starts in DRAFT holding nothing but the human's verbatim words.
+
+    `created_by` is a salted hash of the creator's IP, never the address itself. It
+    exists only to cap how many pools one network can hold open at once — without it,
+    one visitor filling the ceiling denies the demo to everyone else.
+    """
     pool_id = new_id("pool")
     async with _write_lock:
         await db().execute(
             "INSERT INTO pools (pool_id, phase, goal_text, policy_text, currency, "
-            "clock_scale, demo, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            "clock_scale, demo, created_at, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
             (pool_id, "DRAFT", goal_text, policy_text, currency, clock_scale,
-             1 if demo else 0, time.time()),
+             1 if demo else 0, time.time(), created_by),
         )
         await db().commit()
     return pool_id
@@ -280,6 +293,14 @@ async def live_pools() -> list[dict]:
         "SELECT * FROM pools WHERE phase IN ('DRAFT','COLLECTING','RESOLVING','SETTLING') "
         "ORDER BY created_at")
     return [dict(r) for r in await cur.fetchall()]
+
+
+async def count_open_pools_for(ip_hash: str) -> int:
+    cur = await db().execute(
+        "SELECT COUNT(*) AS n FROM pools WHERE phase NOT IN ('CLOSED','ESCALATED') "
+        "AND created_by=?", (ip_hash,))
+    row = await cur.fetchone()
+    return int(row["n"])
 
 
 async def count_open_pools() -> int:

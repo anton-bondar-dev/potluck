@@ -13,7 +13,9 @@ Run with backend/ as the working directory:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -33,10 +35,12 @@ import tools
 from bus import bus
 from config import settings
 from guards import GuardError
-from llm import make_llm
+from llm import LLMError, make_llm
 from paypal import get_paypal_client
 from ticker import Ticker
 from tools import mask_email
+
+_SALT = os.urandom(16)
 
 MAX_GOAL = 600
 MAX_POLICY = 400
@@ -56,7 +60,19 @@ async def lifespan(_app: FastAPI):
     await store.init_db()
     pp = get_paypal_client(on_call=bus_mod.stream_paypal_call, default_origin="agent")
     meter = agent_core.TokenMeter()
-    llm = make_llm()
+    try:
+        llm = make_llm()
+    except LLMError as exc:
+        # Mock mode removes the need for PayPal credentials, not for a model — the agent
+        # is the product. Say so in a sentence instead of a stack trace: this is the
+        # first thing anyone following the README hits.
+        raise RuntimeError(
+            f"{exc}\n\n"
+            "  Potluck needs an LLM even in mock mode — the agent is the whole point.\n"
+            "  Get a free Groq key at https://console.groq.com/keys and put it in\n"
+            "  backend/.env as:  GROQ_API_KEYS=gsk_...\n"
+            "  USE_MOCK_PAYPAL=1 removes the need for PayPal credentials, nothing else."
+        ) from exc
     # Every pool this product runs is a demo pool, so the 2-second cadence is the real
     # one here; tick_real_s exists so the code is honest about what it would do against a
     # pool whose deadline is genuinely three days away.
@@ -99,6 +115,12 @@ def _client_ip(request: Request) -> str:
     if xff:
         return xff.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
+
+
+def _creator_hash(ip: str) -> str:
+    """A salted hash, so the database holds no addresses. The salt is per-process, which
+    is the right lifetime: the cap is about who is hammering the demo right now."""
+    return hashlib.sha256(_SALT + ip.encode()).hexdigest()[:16]
 
 
 def _rate_ok(bucket: str, ip: str, limit: int) -> bool:
@@ -225,9 +247,22 @@ async def create_pool(body: PoolIn, request: Request):
     if not _rate_ok("create", ip, settings.per_ip_per_min):
         raise HTTPException(429, "Too many pools from your network this minute — "
                                  "give it a few seconds.")
+    who = _creator_hash(ip)
+    if await store.count_open_pools_for(who) >= settings.per_ip_live_pools:
+        raise HTTPException(429, f"You already have {settings.per_ip_live_pools} pools "
+                                 "running. Let one of them finish — a demo pool takes "
+                                 "about ninety seconds.")
     if await store.count_open_pools() >= settings.max_live_pools:
         raise HTTPException(503, "The demo is running as many pools as it can hold right "
                                  "now. Try again in a minute.")
+    # One token window is shared by every pool, so starting one with nothing left to
+    # spend produces a pool whose agent never shows up. Refusing with a reason reads
+    # better than accepting and deferring.
+    meter: agent_core.TokenMeter | None = state.get("meter")
+    if meter and meter.remaining() < settings.groq_tpm_reserve:
+        raise HTTPException(503, "The agent has spent its token budget for this minute. "
+                                 "Try again in about a minute — the live demo runs on a "
+                                 "free tier.")
 
     roster = cast_mod.load_cast()
     if body.cids:
@@ -242,7 +277,8 @@ async def create_pool(body: PoolIn, request: Request):
 
     pool_id = await store.create_pool(
         goal_text=body.goal_text.strip(), policy_text=body.policy_text.strip(),
-        clock_scale=settings.clock_scale_demo if body.demo else 1, demo=body.demo)
+        clock_scale=settings.clock_scale_demo if body.demo else 1, demo=body.demo,
+        created_by=who)
     await store.seed_cast(pool_id, wanted)
     # The organizer's words go on the stream exactly as typed. Nothing parses them, here
     # or anywhere else — the model restates the condition and is held to its restatement.
