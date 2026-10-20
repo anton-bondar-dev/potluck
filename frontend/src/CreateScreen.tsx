@@ -21,14 +21,19 @@ const PRESETS: { label: string; hint: string; goal: string; policy: string }[] =
   },
   {
     label: 'The twin: a count, not an amount',
-    hint: 'same numbers, one phrase changed',
+    hint: 'same numbers, opposite branch',
     goal:
       "We're getting Dana a leaving present. Five of us, $45 each, so $180 in total. " +
       'I need it by Friday morning because the party is Friday lunchtime.',
+    // Deliberately a condition the arithmetic cannot satisfy on its own. "At least 4 of
+    // 5" was useless as a proof: with four payers at $45 the head-count and the total
+    // are met together, so both presets release and the comparison shows nothing.
+    // Requiring ALL five makes four payers reach $180 and still fail — same numbers,
+    // opposite branch. Verified against the live agent twice.
     policy:
-      'Refund everyone unless at least 4 of the 5 actually chip in. I want this to be ' +
-      'from the team, not from two people — so even if we somehow hit $180 with fewer ' +
-      'than four payers, give it all back.',
+      'This only works if the whole team is in it, so refund everyone unless all five ' +
+      'of us actually chip in. Even if the money adds up to $180 with four payers, give ' +
+      "it all back — I don't want a gift that one person skipped.",
   },
   {
     label: 'Close enough',
@@ -131,7 +136,8 @@ export default function CreateScreen({ onStart }: { onStart: (poolId: string) =>
           <span className="mt-1 block text-[11px] text-text-faint">
             Write a condition no form could hold — a count of people, a tolerance you'd
             cover yourself, an exception for one person. The agent reads it; nothing parses
-            it.
+            it. Run this preset and the first one with the same four payers: identical
+            arithmetic, opposite branch.
           </span>
         </label>
       </div>

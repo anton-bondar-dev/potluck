@@ -174,6 +174,8 @@ def main() -> int:
     ap.add_argument("--api", default="https://potluck.overpro.fit")
     ap.add_argument("--scrim", type=int, default=230, help="height of the caption scrim")
     ap.add_argument("--music", default="")
+    ap.add_argument("--voice", default="",
+                    help="folder of line-01.mp3 … line-NN.mp3, one per cue, in order")
     ap.add_argument("--endcard", default="", help="a still to hold at the end")
     ap.add_argument("--endcard-s", dest="endcard_s", type=float, default=4.0)
     ap.add_argument("--keep", default="", help="comma list of start-end seconds to keep")
@@ -294,6 +296,31 @@ def main() -> int:
     cues.sort()
     for d in dropped:
         print(f"  ! cue dropped — no anchor: {d}")
+    # --- the voice-over, if it has been recorded -------------------------------
+    # One clip per cue, in order. A spoken line decides how long its caption stays up:
+    # text that disappears while the voice is still saying it reads as a glitch, so the
+    # audio is the master and the caption follows it.
+    voice_plan: list[tuple[float, Path, float]] = []
+    if args.voice:
+        vdir = Path(args.voice)
+        clips = sorted(vdir.glob("line-*.mp3")) or sorted(vdir.glob("line-*.m4a"))
+        if len(clips) != len(cues):
+            print(f"  ! {len(clips)} voice clips for {len(cues)} cues — pairing the first "
+                  f"{min(len(clips), len(cues))} in order")
+        grown = []
+        for i, (a, b, text) in enumerate(cues):
+            if i < len(clips):
+                d = float(probe(clips[i], "duration") or 0)
+                voice_plan.append((a, clips[i], d))
+                b = max(b, a + d + 0.35)
+            grown.append((a, b, text))
+        cues = grown
+        for i in range(len(cues) - 1):
+            if cues[i][1] > cues[i + 1][0] + 0.05:
+                over = cues[i][1] - cues[i + 1][0]
+                print(f"  ! line {i + 1} runs {over:.1f}s into line {i + 2} — shorten the "
+                      f"script or move the cue: \"{cues[i][2][:52]}\"")
+
     ass_path = work / "caps.ass"
     ass_path.write_text(build_ass(cues, w, h))
     print(f"captions: {len(cues)} cues -> {ass_path}")
@@ -310,11 +337,38 @@ def main() -> int:
     vf = (f"[0:v][1:v]overlay=0:{h - args.scrim}[bg];"
           f"[bg]ass={ass_path}:fontsdir=/System/Library/Fonts[v]")
     cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", final_src, "-i", scrim]
+    audio_filter, amap = "", None
+    n_in = 2
     if args.music:
         cmd += ["-i", args.music]
-    cmd += ["-filter_complex", vf, "-map", "[v]"]
-    if args.music:
-        cmd += ["-map", "2:a", "-c:a", "aac", "-b:a", "160k", "-shortest"]
+        music_idx = n_in
+        n_in += 1
+    if voice_plan:
+        voice_parts = []
+        for start, clip, _d in voice_plan:
+            cmd += ["-i", str(clip)]
+            voice_parts.append(f"[{n_in}:a]adelay={int(start * 1000)}|{int(start * 1000)}"
+                               f"[v{n_in}]")
+            n_in += 1
+        tags = "".join(f"[v{i}]" for i in range(n_in - len(voice_plan), n_in))
+        audio_filter = (";".join(voice_parts)
+                        + f";{tags}amix=inputs={len(voice_plan)}:normalize=0,"
+                          "loudnorm=I=-17:TP=-1.5:LRA=11[vox]")
+        if args.music:
+            # Duck the bed under the voice rather than setting it quiet throughout: the
+            # music can breathe between lines and still never fight the narration.
+            audio_filter += (f";[{music_idx}:a][vox]sidechaincompress="
+                             "threshold=0.03:ratio=9:attack=12:release=420[duck]"
+                             ";[duck][vox]amix=inputs=2:normalize=0:duration=first[aout]")
+            amap = "[aout]"
+        else:
+            amap = "[vox]"
+    elif args.music:
+        amap = f"{music_idx}:a"
+
+    cmd += ["-filter_complex", vf + (";" + audio_filter if audio_filter else ""), "-map", "[v]"]
+    if amap:
+        cmd += ["-map", amap, "-c:a", "aac", "-b:a", "176k", "-shortest"]
     cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p",
             "-movflags", "+faststart", out]
     run(cmd)
