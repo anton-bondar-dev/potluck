@@ -181,7 +181,8 @@ done
 # 433 passing, 0 failing
 ```
 
-`tests/test_guards.py` is an adversarial table: ~25 hostile payloads each asserted blocked.
+`tests/test_guards.py` is an adversarial table: 35 hostile or malformed payloads, each
+asserted blocked with the exact refusal code.
 The races live where the locks do — twelve concurrent phase advances and twelve concurrent
 claims on one pool (`tests/test_store.py:48`), and two tickers racing one pool
 (`tests/test_ticker.py`), each asserting exactly one winner. The suites are written to be
