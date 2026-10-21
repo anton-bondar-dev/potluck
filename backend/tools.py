@@ -158,7 +158,7 @@ SCHEMAS = {
 
 def menu_for_phase(phase: str, *, deadline_reached: bool = False,
                    target_met: bool = False) -> list[dict]:
-    """Hand the model 1-4 schemas, never 9.
+    """Hand the model 1 to 6 schemas, never all 9.
 
     This is the biggest single saving on tokens AND a real guardrail: resolve_pool is not
     merely discouraged during collection, it is absent from the menu and refused by
